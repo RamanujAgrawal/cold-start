@@ -61,7 +61,7 @@ def chat(messages, model=None, temperature=0, max_tokens=None, response_format=N
         body["response_format"] = response_format
     
     # Dynamic pacing delay based on active pool size
-    delay = 0.2 if len(keys) >= 5 else (0.5 if len(keys) >= 3 else (1.5 if len(keys) > 1 else 4.0))
+    delay = 0.6 if len(keys) >= 5 else (1.0 if len(keys) >= 3 else (2.0 if len(keys) > 1 else 4.0))
     time.sleep(delay)
     
     started = time.time()
