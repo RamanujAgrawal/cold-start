@@ -1,0 +1,25 @@
+# The challenge data stays on your machine. Never commit it.
+data/
+*.zip
+
+# API Keys & Secrets
+.env
+*.key
+
+# Output files from runs
+output.json
+out.json
+out_*.json
+usage.jsonl
+
+# Cache files
+.cache*
+
+# Python bytecode & virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.DS_Store
