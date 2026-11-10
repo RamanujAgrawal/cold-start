@@ -38,6 +38,12 @@ NON_INFORMATIVE = {
     "[photo]", "[video]", "[document]"
 }
 
+FILLER_WORDS = {
+    "ok", "okay", "k", "yes", "no", "yeah", "yep", "sure", "done", "cool",
+    "great", "nice", "fine", "thanks", "thank you", "thx", "tc", "gm", "gn",
+    "haha", "hahaha", "lol"
+}
+
 
 def format_compact_window(msgs_window, is_dm=True, person_names=None):
     """Format messages compactly to minimize prompt tokens."""
@@ -46,54 +52,32 @@ def format_compact_window(msgs_window, is_dm=True, person_names=None):
         b = (m.get("body") or "").strip()
         if not b or b in NON_INFORMATIVE:
             continue
-        # Truncate overly long bodies (e.g. pasted logs/articles) to max 120 chars
-        if len(b) > 120:
-            b = b[:117] + "..."
+        # Drop 1-2 word filler messages that contain no numbers or action triggers
+        b_low = b.lower()
+        if b_low in FILLER_WORDS:
+            continue
+        # Truncate overly long bodies to max 85 chars
+        if len(b) > 85:
+            b = b[:82] + "..."
         sid = m["sender_id"]
         mid = m["id"]
-        if sid == "ME":
-            sender = "ME"
-        elif is_dm:
-            sender = sid
-        else:
-            name = (person_names or {}).get(sid, sid).split()[0]
-            sender = f"{sid} ({name})"
-        lines.append(f"[{mid}] {sender}: {b}")
+        lines.append(f"[{mid}] {sid}: {b}")
     return "\n".join(lines)
 
 
 def get_loop_system_prompt(me_name):
     """Generate concise system prompt dynamically adapted to the user."""
-    return f"""Extract all task loops (commitments, followups, deadlines, questions) from WhatsApp chats.
-Primary user is {me_name} (ID: ME). Other participants have IDs like P01, P02.
+    return f"""Extract all task loops (commitments, followups, deadlines, questions) from WhatsApp chats for user {me_name} (ID: ME) and other participants (Pxx).
+CRITICAL: Extract ALL substantive tasks/requests/promises across EVERY chat — whether owned by ME or Pxx, both OPEN and DONE/DROPPED.
 
-CRITICAL: Extract ALL tasks/requests/promises/questions — both OPEN and DONE/DROPPED.
-
-Output a compact JSON array of objects:
-- For DONE/DROPPED loops:
-  {{"title": "...", "type": "commitment|followup|deadline|question", "owner": "ME|Pxx", "chat_id": "...", "source_msg": "Mxxx", "due": "YYYY-MM-DD"|null, "status": "done|dropped", "closed_by": "Mxxx"}}
-
-- For OPEN loops only:
-  {{"title": "...", "type": "commitment|followup|deadline|question", "owner": "ME|Pxx", "chat_id": "...", "source_msg": "Mxxx", "due": "YYYY-MM-DD"|null, "status": "open", "closed_by": null, "help": {{"action": "assist|remind|leave", "next_step": "..."|"remind_at": "..."|"reason": "..."}}}}
-
+Output JSON array:
+- DONE/DROPPED: {{"title":"...","type":"commitment|followup|deadline|question","owner":"ME|Pxx","chat_id":"...","source_msg":"Mxxx","due":"YYYY-MM-DD"|null,"status":"done|dropped","closed_by":"Mxxx"|null}}
+- OPEN: {{"title":"...","type":"commitment|followup|deadline|question","owner":"ME|Pxx","chat_id":"...","source_msg":"Mxxx","due":"YYYY-MM-DD"|null,"status":"open","closed_by":null,"help":{{"action":"assist|remind|leave","next_step":"..."|"remind_at":"..."|"reason":"..."}}}}
 RULES:
-- ONLY extract substantive actionable tasks: payments/transfers, appointments/meetings, bookings/travel, orders/purchases, deliverables, and decisions.
-- DO NOT extract conversational courtesies like "call when free", "ping me", or "talk soon".
-- "done": if resolved/paid/booked/confirmed by a later msg (set closed_by to that msg ID if present, or null).
-- "dropped": if cancelled/declined.
-- "open": if still pending action (closed_by: null).
-- help (ONLY for open loops):
-  - "leave": if owner is NOT ME, or private personal matter.
-  - "assist": assistant can draft/research/book with approval (give next_step, needs_yes: true).
-  - "remind": only {me_name} can decide or act (give remind_at).
-
-EXAMPLES:
-[
-  {{"title": "Arrange car at airport by 4pm", "type": "deadline", "owner": "ME", "chat_id": "C01", "source_msg": "M001", "due": null, "status": "done", "closed_by": null}},
-  {{"title": "Decide whether to order studio rug", "type": "question", "owner": "ME", "chat_id": "C01", "source_msg": "M002", "due": null, "status": "done", "closed_by": null}},
-  {{"title": "Transfer payment of 3,500 to vendor", "type": "commitment", "owner": "ME", "chat_id": "C01", "source_msg": "M003", "due": null, "status": "open", "closed_by": null, "help": {{"action": "assist", "next_step": "Draft transfer confirmation", "needs_yes": true}}}}
-]
-Return ONLY a valid JSON array."""
+- Substantive actionable tasks: payments, meetings, bookings, deliverables, decisions. Skip conversational courtesies ("call when free", "ping me").
+- "done": if completed/paid/confirmed later (closed_by=msg ID or null). "open": if still pending (closed_by=null).
+- help: action="leave" (if owner!=ME or private personal matter); "assist" (assistant can draft/research/book, needs_yes: true); "remind" (only {me_name} can decide/act).
+Return ONLY valid JSON array: [] if none."""
 
 
 def safe_parse_json_array(text):
@@ -149,7 +133,11 @@ def detect_loops(chats, messages, indices, seed, circles):
 
         is_dm = not c.get("is_group", False)
         is_family = any(w in c["name"].lower() for w in ["family", "home", "house"])
+        parts_count = len(c.get("participants", []))
 
+        # Skip large broadcast / community lurker channels where user has sent 0 messages
+        if not is_dm and me_msgs_count == 0 and not is_family and parts_count >= 8:
+            continue
         # Skip automated / broadcast channels where user rarely or never participates
         if not is_dm and count > 40 and me_msgs_count <= 5 and not is_family:
             continue
@@ -166,7 +154,7 @@ def detect_loops(chats, messages, indices, seed, circles):
         else:
             current_small_group.append(cid)
             current_small_count += count
-            if current_small_count >= 35:
+            if current_small_count >= 28:
                 small_chat_groups.append(current_small_group)
                 current_small_group = []
                 current_small_count = 0
@@ -182,12 +170,12 @@ def detect_loops(chats, messages, indices, seed, circles):
         is_dm = not c.get("is_group", False)
 
         chat_parts = [
-            f"{p} ({indices['person_names'].get(p, p).split()[0]}: {circles.get(p, 'unknown')})"
+            f"{p}:{indices['person_names'].get(p, p).split()[0]}"
             for p in c.get("participants", []) if p != "ME"
         ]
-        circle_ctx = f"Participants: {', '.join(chat_parts)}" if chat_parts else ""
+        circle_ctx = f"People: {', '.join(chat_parts[:12])}" if chat_parts else ""
 
-        chunks = chunk_messages(chat_msgs, chunk_size=45, overlap=8)
+        chunks = chunk_messages(chat_msgs, chunk_size=40, overlap=6)
         for i, chunk in enumerate(chunks):
             chunk_text = " ".join((m.get("body") or "") for m in chunk)
             if not TRIGGER_PATTERN.search(chunk_text):
@@ -211,10 +199,10 @@ def detect_loops(chats, messages, indices, seed, circles):
 
         if combined_text.strip():
             group_parts = [
-                f"{p} ({indices['person_names'].get(p, p).split()[0]}: {circles.get(p, 'unknown')})"
-                for p in group_pids
+                f"{p}:{indices['person_names'].get(p, p).split()[0]}"
+                for p in list(group_pids)[:12]
             ]
-            group_circle_context = f"Participants: {', '.join(group_parts)}" if group_parts else ""
+            group_circle_context = f"People: {', '.join(group_parts)}" if group_parts else ""
             tasks.append(("group", combined_text, group_circle_context, f"small chat group {g_idx+1}/{len(small_chat_groups)}"))
 
     def _execute_loop_task(task_item):
@@ -323,7 +311,7 @@ Extract all loops (commitments, followups, deadlines, questions) — both OPEN a
         response = chat(
             [{"role": "system", "content": sys_prompt}, {"role": "user", "content": prompt}],
             temperature=0,
-            max_tokens=500,
+            max_tokens=800,
         )
         loops = safe_parse_json_array(response)
         _validate_and_add_loops(loops, msg_ids, all_loops, indices["all_people"])
@@ -344,7 +332,7 @@ Extract all loops (commitments, followups, deadlines, questions) — both OPEN a
         response = chat(
             [{"role": "system", "content": sys_prompt}, {"role": "user", "content": prompt}],
             temperature=0,
-            max_tokens=500,
+            max_tokens=800,
         )
         loops = safe_parse_json_array(response)
         _validate_and_add_loops(loops, msg_ids, all_loops, indices["all_people"])
