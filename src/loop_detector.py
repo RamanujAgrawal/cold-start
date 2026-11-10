@@ -173,31 +173,6 @@ def detect_loops(chats, messages, indices, seed, circles):
     if current_small_group:
         small_chat_groups.append(current_small_group)
 
-    h = hashlib.md5(f"{len(chats)}_{len(messages)}".encode()).hexdigest()[:8]
-    loop_cache_file = Path(__file__).resolve().parent.parent / f".cache_loops_{h}.json"
-    if loop_cache_file.exists():
-        try:
-            cached_loops = json.loads(loop_cache_file.read_text(encoding="utf-8"))
-            print(f"  Loaded {len(cached_loops)} loops from local cache", file=sys.stderr)
-            return cached_loops
-        except Exception:
-            pass
-
-    chunk_cache_file = Path(__file__).resolve().parent.parent / f".cache_loop_chunks_{h}.json"
-    chunk_cache = {}
-    if chunk_cache_file.exists():
-        try:
-            chunk_cache = json.loads(chunk_cache_file.read_text(encoding="utf-8"))
-            print(f"  Loaded {len(chunk_cache)} cached chunks", file=sys.stderr)
-        except Exception:
-            chunk_cache = {}
-
-    def save_chunk_cache():
-        try:
-            chunk_cache_file.write_text(json.dumps(chunk_cache), encoding="utf-8")
-        except Exception:
-            pass
-
     # Process large chats in compact 45-message chunks with 8-message overlap
     for cid in large_chats:
         chat_msgs = indices["msgs_by_chat"].get(cid, [])
@@ -216,7 +191,7 @@ def detect_loops(chats, messages, indices, seed, circles):
             if not TRIGGER_PATTERN.search(chunk_text):
                 continue
             print(f"  Processing {cid} chunk {i+1}/{len(chunks)}...", file=sys.stderr)
-            _process_chunk(c, chunk, is_dm, circle_ctx, indices, msg_ids, all_loops, sys_prompt, chunk_cache, save_chunk_cache)
+            _process_chunk(c, chunk, is_dm, circle_ctx, indices, msg_ids, all_loops, sys_prompt)
 
     # Process small chat groups
     for g_idx, group in enumerate(small_chat_groups):
@@ -241,7 +216,7 @@ def detect_loops(chats, messages, indices, seed, circles):
                 for p in group_pids
             ]
             group_circle_context = f"Participants: {', '.join(group_parts)}" if group_parts else ""
-            _process_combined_text(combined_text, group_circle_context, indices, msg_ids, all_loops, sys_prompt, chunk_cache, save_chunk_cache)
+            _process_combined_text(combined_text, group_circle_context, indices, msg_ids, all_loops, sys_prompt)
 
     # Deduplicate loops by (source_msg, title_prefix)
     deduped = {}
@@ -310,22 +285,11 @@ def detect_loops(chats, messages, indices, seed, circles):
 
         final_loops.append(loop)
 
-    result = final_loops
-    try:
-        loop_cache_file.write_text(json.dumps(result, indent=2), encoding="utf-8")
-    except Exception:
-        pass
-    return result
+    return final_loops
 
 
-def _process_chunk(chat_obj, msgs, is_dm, circle_context, indices, msg_ids, all_loops, sys_prompt, chunk_cache, save_cache_fn):
+def _process_chunk(chat_obj, msgs, is_dm, circle_context, indices, msg_ids, all_loops, sys_prompt):
     """Process a single chunk with compact formatting."""
-    chunk_id = hashlib.md5((f"{chat_obj['chat_id']}_" + "_".join(m["id"] for m in msgs)).encode()).hexdigest()[:12]
-    if chunk_cache is not None and chunk_id in chunk_cache:
-        loops = chunk_cache[chunk_id]
-        _validate_and_add_loops(loops, msg_ids, all_loops, indices["all_people"])
-        return
-
     msgs_text = format_compact_window(msgs, is_dm, indices["person_names"])
     if not msgs_text.strip():
         return
@@ -345,23 +309,13 @@ Extract all loops (commitments, followups, deadlines, questions) — both OPEN a
             max_tokens=500,
         )
         loops = safe_parse_json_array(response)
-        if chunk_cache is not None:
-            chunk_cache[chunk_id] = loops
-            if save_cache_fn:
-                save_cache_fn()
         _validate_and_add_loops(loops, msg_ids, all_loops, indices["all_people"])
     except Exception as e:
         print(f"  Warning: Loop detection failed for {chat_obj['chat_id']}: {e}", file=sys.stderr)
 
 
-def _process_combined_text(combined_text, circle_context, indices, msg_ids, all_loops, sys_prompt, chunk_cache, save_cache_fn):
+def _process_combined_text(combined_text, circle_context, indices, msg_ids, all_loops, sys_prompt):
     """Process combined small chats text."""
-    chunk_id = hashlib.md5(combined_text.encode()).hexdigest()[:12]
-    if chunk_cache is not None and chunk_id in chunk_cache:
-        loops = chunk_cache[chunk_id]
-        _validate_and_add_loops(loops, msg_ids, all_loops, indices["all_people"])
-        return
-
     prompt = f"""{circle_context}
 
 CHATS AND MESSAGES:
@@ -376,10 +330,6 @@ Extract all loops (commitments, followups, deadlines, questions) — both OPEN a
             max_tokens=500,
         )
         loops = safe_parse_json_array(response)
-        if chunk_cache is not None:
-            chunk_cache[chunk_id] = loops
-            if save_cache_fn:
-                save_cache_fn()
         _validate_and_add_loops(loops, msg_ids, all_loops, indices["all_people"])
     except Exception as e:
         print(f"  Warning: Loop detection failed for combined chats: {e}", file=sys.stderr)

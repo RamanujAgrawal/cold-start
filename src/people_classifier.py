@@ -41,20 +41,7 @@ Return ONLY a JSON object mapping person_id to circle. Example:
 
 def classify_people(chats, messages, indices, seed):
     """Classify all people into circles."""
-    import hashlib
-    from pathlib import Path
-    
     all_people = indices["all_people"]
-    h = hashlib.md5(f"{len(all_people)}_{len(messages)}".encode()).hexdigest()[:8]
-    cache_path = Path(__file__).resolve().parent.parent / f".cache_circles_{h}.json"
-    if cache_path.exists():
-        try:
-            cached = json.loads(cache_path.read_text(encoding="utf-8"))
-            print(f"  Loaded {len(cached)} circles from local cache", file=sys.stderr)
-            return cached
-        except Exception:
-            pass
-
     seeded_circles = seed.get("circles", {})
     
     # Start with seeded circles
@@ -216,10 +203,5 @@ Valid circles: {VALID_CIRCLES}"""
     for pid in all_people:
         if pid not in result:
             result[pid] = "friend"
-    
-    try:
-        cache_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
-    except Exception:
-        pass
     
     return result

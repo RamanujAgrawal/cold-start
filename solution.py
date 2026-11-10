@@ -31,11 +31,6 @@ def main(input_dir, output_path):
     print(f"  ME = {indices['me_name']}", file=sys.stderr)
     print(f"  Seed: {len(seed.get('circles', {}))} circles, {len(seed.get('organisations', []))} orgs, {len(seed.get('goals', []))} goals", file=sys.stderr)
     
-    import hashlib
-    h = hashlib.md5(f"{len(indices['all_people'])}_{len(messages)}".encode()).hexdigest()[:8]
-    orgs_cache = Path(__file__).parent / f".cache_orgs_{h}.json"
-    goals_cache = Path(__file__).parent / f".cache_goals_{h}.json"
-
     # Stage 1: Classify people into circles
     print("\nStage 1: Classifying people...", file=sys.stderr)
     circles = classify_people(chats, messages, indices, seed)
@@ -43,19 +38,7 @@ def main(input_dir, output_path):
     
     # Stage 2: Detect organisations and assign chats
     print("\nStage 2: Detecting organisations and assigning chats...", file=sys.stderr)
-    if orgs_cache.exists():
-        try:
-            cached_org_data = json.loads(orgs_cache.read_text(encoding="utf-8"))
-            orgs, chat_ties = cached_org_data["orgs"], cached_org_data["chats"]
-            print(f"  Loaded {len(orgs)} orgs from local cache", file=sys.stderr)
-        except Exception:
-            orgs, chat_ties = detect_orgs_and_assign_chats(chats, messages, indices, seed, circles)
-    else:
-        orgs, chat_ties = detect_orgs_and_assign_chats(chats, messages, indices, seed, circles)
-        try:
-            orgs_cache.write_text(json.dumps({"orgs": orgs, "chats": chat_ties}, indent=2), encoding="utf-8")
-        except Exception:
-            pass
+    orgs, chat_ties = detect_orgs_and_assign_chats(chats, messages, indices, seed, circles)
     print(f"  Found {len(orgs)} organisations, assigned {len(chat_ties)} chats", file=sys.stderr)
     
     # Stage 3: Build people with links
@@ -65,18 +48,7 @@ def main(input_dir, output_path):
     
     # Stage 4: Extract goals
     print("\nStage 4: Extracting goals...", file=sys.stderr)
-    if goals_cache.exists():
-        try:
-            goals = json.loads(goals_cache.read_text(encoding="utf-8"))
-            print(f"  Loaded {len(goals)} goals from local cache", file=sys.stderr)
-        except Exception:
-            goals = extract_goals(chats, messages, indices, seed, circles)
-    else:
-        goals = extract_goals(chats, messages, indices, seed, circles)
-        try:
-            goals_cache.write_text(json.dumps(goals, indent=2), encoding="utf-8")
-        except Exception:
-            pass
+    goals = extract_goals(chats, messages, indices, seed, circles)
     print(f"  Found {len(goals)} goals", file=sys.stderr)
     
     # Stage 5: Detect open loops
