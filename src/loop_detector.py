@@ -2,12 +2,13 @@
 
 Optimized for minimal token usage, low payload, and 100% generalizable across any user.
 """
+import concurrent.futures
 import json
 import re
 import sys
 import hashlib
 from pathlib import Path
-from .llm_client import chat
+from .llm_client import chat, _get_api_keys
 from .data_loader import chunk_messages
 
 
@@ -173,7 +174,8 @@ def detect_loops(chats, messages, indices, seed, circles):
     if current_small_group:
         small_chat_groups.append(current_small_group)
 
-    # Process large chats in compact 45-message chunks with 8-message overlap
+    # Build tasks for large chats and small chat groups
+    tasks = []
     for cid in large_chats:
         chat_msgs = indices["msgs_by_chat"].get(cid, [])
         c = indices["chat_by_id"][cid]
@@ -190,10 +192,8 @@ def detect_loops(chats, messages, indices, seed, circles):
             chunk_text = " ".join((m.get("body") or "") for m in chunk)
             if not TRIGGER_PATTERN.search(chunk_text):
                 continue
-            print(f"  Processing {cid} chunk {i+1}/{len(chunks)}...", file=sys.stderr)
-            _process_chunk(c, chunk, is_dm, circle_ctx, indices, msg_ids, all_loops, sys_prompt)
+            tasks.append(("chunk", c, chunk, is_dm, circle_ctx, f"{cid} chunk {i+1}/{len(chunks)}"))
 
-    # Process small chat groups
     for g_idx, group in enumerate(small_chat_groups):
         combined_text = ""
         group_pids = set()
@@ -210,13 +210,30 @@ def detect_loops(chats, messages, indices, seed, circles):
                 combined_text += f"\n--- Chat {c['chat_id']}: \"{c['name']}\" ---\n{formatted}\n"
 
         if combined_text.strip():
-            print(f"  Processing small chat group {g_idx+1}/{len(small_chat_groups)}...", file=sys.stderr)
             group_parts = [
                 f"{p} ({indices['person_names'].get(p, p).split()[0]}: {circles.get(p, 'unknown')})"
                 for p in group_pids
             ]
             group_circle_context = f"Participants: {', '.join(group_parts)}" if group_parts else ""
-            _process_combined_text(combined_text, group_circle_context, indices, msg_ids, all_loops, sys_prompt)
+            tasks.append(("group", combined_text, group_circle_context, f"small chat group {g_idx+1}/{len(small_chat_groups)}"))
+
+    def _execute_loop_task(task_item):
+        t_type = task_item[0]
+        local_loops = []
+        if t_type == "chunk":
+            _, c, chunk, is_dm, circle_ctx, desc = task_item
+            _process_chunk(c, chunk, is_dm, circle_ctx, indices, msg_ids, local_loops, sys_prompt)
+        else:
+            _, combined_text, group_circle_context, desc = task_item
+            _process_combined_text(combined_text, group_circle_context, indices, msg_ids, local_loops, sys_prompt)
+        return local_loops
+
+    keys = _get_api_keys()
+    num_workers = min(max(1, len(keys)), 5)
+    print(f"  Executing {len(tasks)} loop tasks using {num_workers} concurrent workers...", file=sys.stderr)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+        for partial in executor.map(_execute_loop_task, tasks):
+            all_loops.extend(partial)
 
     # Deduplicate loops by (source_msg, title_prefix)
     deduped = {}

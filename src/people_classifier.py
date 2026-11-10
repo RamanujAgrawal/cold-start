@@ -1,7 +1,8 @@
 """Classify each person into a circle (relationship type)."""
+import concurrent.futures
 import json
 import sys
-from .llm_client import chat
+from .llm_client import chat, _get_api_keys
 from .data_loader import format_messages_window
 
 
@@ -158,20 +159,20 @@ def classify_people(chats, messages, indices, seed):
     
     # Batch classify — send 12 people per LLM call
     batch_size = 12
-    for i in range(0, len(unclassified), batch_size):
-        batch = unclassified[i:i + batch_size]
-        batch_context = "\n---\n".join(person_contexts[p] for p in batch if p in person_contexts)
-        
-        # Add context about known people/orgs from seed
-        seed_context = ""
-        if seeded_circles:
-            seed_context = "Known circles: " + ", ".join(f"{pid}:{c}" for pid, c in list(seeded_circles.items())[:6]) + "\n"
-        
-        seed_orgs = seed.get("organisations", [])
-        if seed_orgs:
-            seed_context += f"Known orgs: {', '.join(seed_orgs)}\n"
+    batches = [unclassified[i:i + batch_size] for i in range(0, len(unclassified), batch_size)]
+    keys = _get_api_keys()
+    num_workers = min(max(1, len(keys)), 5)
+    me_name = indices.get("me_name", "User")
 
-        me_name = indices.get("me_name", "User")
+    seed_context = ""
+    if seeded_circles:
+        seed_context = "Known circles: " + ", ".join(f"{pid}:{c}" for pid, c in list(seeded_circles.items())[:6]) + "\n"
+    seed_orgs = seed.get("organisations", [])
+    if seed_orgs:
+        seed_context += f"Known orgs: {', '.join(seed_orgs)}\n"
+
+    def process_batch(batch):
+        batch_context = "\n---\n".join(person_contexts[p] for p in batch if p in person_contexts)
         prompt = f"""Classify these people's relationship to user {me_name} (ID: ME).
 {seed_context}
 People to classify:
@@ -179,25 +180,25 @@ People to classify:
 
 Return ONLY a JSON object mapping person_id to circle.
 Valid circles: {VALID_CIRCLES}"""
-
         try:
             response = chat(
                 [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}],
                 temperature=0,
                 max_tokens=600,
             )
-            # Parse response
             response = response.strip()
             if response.startswith("```"):
                 response = response.split("\n", 1)[1]
                 response = response.rsplit("```", 1)[0]
-            
             classifications = json.loads(response)
-            for pid, circle in classifications.items():
-                if circle in VALID_CIRCLES and pid in batch:
-                    result[pid] = circle
+            return {pid: circle for pid, circle in classifications.items() if circle in VALID_CIRCLES and pid in batch}
         except Exception as e:
             print(f"  Warning: LLM classification failed for batch: {e}", file=sys.stderr)
+            return {}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+        for partial in executor.map(process_batch, batches):
+            result.update(partial)
     
     # Default any remaining unclassified to "friend" (safe fallback)
     for pid in all_people:
