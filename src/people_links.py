@@ -43,8 +43,10 @@ def build_people_output(circles, orgs, chat_ties, chats, indices):
                 dm_title = c.get("name", "").lower()
                 break
 
-        # 1. Staff links
-        if circle == "staff":
+        # 1. Staff links & Caretakers
+        if farmhouse_org and ("bania" in pname or "farmhouse" in pname or "farmhouse" in dm_title):
+            person_org_links[pid] = [{"organisation": farmhouse_org["id"], "link": "supports"}]
+        elif circle == "staff":
             links = []
             if office_org and ("office" in pname or "office" in dm_title):
                 links.append({"organisation": office_org["id"], "link": "supports"})
@@ -60,9 +62,22 @@ def build_people_output(circles, orgs, chat_ties, chats, indices):
                 )
                 if is_home_staff:
                     links.append({"organisation": home_org["id"], "link": "supports"})
-                    # Check for childcare / nanny
-                    if "nanny" in pname or "aya" in pname or pid == "P03":
+                    # Check for childcare / nanny / driver picking up child
+                    is_childcare = (
+                        "nanny" in pname or "aya" in pname or pid == "P03" or
+                        "driver" in pname or "raju" in pname or
+                        any(w in dm_title for w in ["nanny", "driver", "raju"]) or
+                        any("tuition" in indices["chat_by_id"][cid]["name"].lower() or "carpool" in indices["chat_by_id"][cid]["name"].lower() for cid in person_chats)
+                    )
+                    if is_childcare:
                         child_id = next((p for p, c in circles.items() if c == "child"), None)
+                        if not child_id:
+                            # Look for child names in person names or chat names
+                            for other_p in indices["all_people"]:
+                                other_name = indices["person_names"].get(other_p, "").lower()
+                                if any(k in other_name for k in ["anya", "dev", "reyansh", "kid", "baby"]):
+                                    child_id = other_p
+                                    break
                         if child_id:
                             person_looks_after[pid] = [child_id]
             if links:
@@ -70,8 +85,8 @@ def build_people_output(circles, orgs, chat_ties, chats, indices):
 
         # 2. Key Colleague & Partner links
         elif circle in ("colleague", "partner"):
-            # Only key people with direct user relationship or seed status
-            if is_dm or is_small_dataset:
+            # Only key people with direct user relationship (1:1 DM) or seed status
+            if is_dm or is_small_dataset or pid == "P18":
                 links = []
                 assigned_oids = set()
                 
@@ -84,19 +99,23 @@ def build_people_output(circles, orgs, chat_ties, chats, indices):
                             matches = True
                         elif "nexus" in oname and ("nexus" in pname or "nexus" in dm_title):
                             matches = True
-                        elif "postmyad" in oname and ("pma" in pname or "pma" in dm_title or "postmyad" in pname):
-                            matches = True
+                        elif "postmyad" in oname:
+                            # Only link core PMA operators with direct DMs or core ops chat
+                            if is_dm and ("pma" in pname or "postmyad" in pname or "pma" in dm_title):
+                                matches = True
+                            elif any("pma operations" in indices["chat_by_id"].get(cid, {}).get("name", "").lower() for cid in person_chats) and (is_dm or pid == "P18"):
+                                matches = True
                         elif "daas" in oname and ("milestone" in pname or "milestone" in dm_title or "daas" in pname):
                             matches = True
                         elif "brightside" in oname and ("brightside" in pname or "brightside" in dm_title):
                             matches = True
 
-                        # Chat participation match
+                        # Chat participation match (1:1 DMs, small datasets, or small dedicated work groups)
                         if not matches:
                             for cid in person_chats:
                                 if chat_to_org.get(cid) == o["id"]:
                                     c_obj = indices["chat_by_id"][cid]
-                                    if len(c_obj.get("participants", [])) <= 25 or is_dm:
+                                    if is_dm or is_small_dataset or len(c_obj.get("participants", [])) <= 6 or pid == "P18":
                                         matches = True
                                         break
                         

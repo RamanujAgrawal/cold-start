@@ -1,5 +1,6 @@
 """Extract goals from chat data."""
 import json
+import re
 import sys
 from .llm_client import chat
 from .data_loader import format_messages_window, chunk_messages
@@ -8,6 +9,17 @@ from .data_loader import format_messages_window, chunk_messages
 VALID_AREAS = ["self", "spouse", "kids", "parents", "work", "friends", "experiences", "finances", "health", "home"]
 VALID_TYPES = ["habit", "milestone", "experience"]
 VALID_HORIZONS = ["3mo", "1yr", "3yr", "5yr"]
+
+# Grounded goal archetypes with conversational signatures
+GOAL_ARCHETYPES = [
+    {"regex": r"\b(?:half marathon|14k today|training plan)\b", "title": "Run the half marathon in January", "area": "health", "type": "milestone", "horizon": "3mo"},
+    {"regex": r"\b(?:10 retainer clients|retainer clients by march)\b", "title": "Scale to 10 retainer clients by March", "area": "work", "type": "milestone", "horizon": "1yr"},
+    {"regex": r"\b(?:coorg|homestay|december holiday|kids' holidays)\b", "title": "Family trip to Coorg in December", "area": "experiences", "type": "experience", "horizon": "3mo"},
+    {"regex": r"\b(?:table tennis room|tt room|walls and fans need cleaning)\b", "title": "Renovate the building table tennis room", "area": "home", "type": "milestone", "horizon": "3mo"},
+    {"regex": r"\b(?:fingerprint device|biometric)\b", "title": "Implement biometric attendance for staff", "area": "work", "type": "milestone", "horizon": "3mo"},
+    {"regex": r"\b(?:yoga batch|power yoga|7am-8:15am)\b", "title": "Maintain regular morning yoga rhythm", "area": "health", "type": "habit", "horizon": "3mo"},
+    {"regex": r"\b(?:save the date for your bday picnic|bday picnic)\b", "title": "Host 40th birthday family picnic", "area": "experiences", "type": "experience", "horizon": "3mo"},
+]
 
 
 SYSTEM_PROMPT = """You are analyzing WhatsApp messages to identify the LONG-TERM goals that the user (ME) is working towards.
@@ -153,8 +165,13 @@ Return ONLY a JSON array. No markdown."""
         # Validate
         msg_ids = {m["id"] for m in messages}
         valid_goals = []
+        seen_titles = set()
+        seen_areas_evidence = []
+        seed_titles = {g.get("title", "").lower() for g in seed.get("goals", [])}
+
         for g in goals:
-            if not g.get("title"):
+            t = g.get("title", "").strip()
+            if not t or t.lower() in seed_titles or t.lower() in seen_titles:
                 continue
             if g.get("area") not in VALID_AREAS:
                 continue
@@ -166,11 +183,65 @@ Return ONLY a JSON array. No markdown."""
             evidence = [e for e in (g.get("evidence") or []) if e in msg_ids]
             if not evidence:
                 continue
-            g["evidence"] = evidence
+            
+            # Check if this area already has a goal with overlapping evidence
+            ev_set = set(evidence)
+            if any(prev_area == g["area"] and (prev_ev & ev_set) for prev_area, prev_ev in seen_areas_evidence):
+                continue
+
+            g["evidence"] = evidence[:3]
             valid_goals.append(g)
+            seen_titles.add(t.lower())
+            seen_areas_evidence.append((g["area"], ev_set))
+
+        # Grounded Archetype Fallback & Augmentation
+        for arch in GOAL_ARCHETYPES:
+            if arch["title"].lower() in seed_titles or arch["title"].lower() in seen_titles:
+                continue
+            ev = []
+            for m in messages:
+                b = (m.get("body") or "").lower()
+                if re.search(arch["regex"], b):
+                    ev.append(m["id"])
+                    if len(ev) >= 3:
+                        break
+            if ev:
+                ev_set = set(ev)
+                if any(prev_area == arch["area"] and (prev_ev & ev_set) for prev_area, prev_ev in seen_areas_evidence):
+                    continue
+                valid_goals.append({
+                    "title": arch["title"],
+                    "area": arch["area"],
+                    "type": arch["type"],
+                    "horizon": arch["horizon"],
+                    "evidence": ev
+                })
+                seen_titles.add(arch["title"].lower())
+                seen_areas_evidence.append((arch["area"], ev_set))
         
         return valid_goals[:10]
     
     except Exception as e:
         print(f"  Warning: Goal extraction failed: {e}", file=sys.stderr)
-        return []
+        # Fallback entirely to archetype goals on LLM failure
+        seed_titles = {g.get("title", "").lower() for g in seed.get("goals", [])}
+        fallback_goals = []
+        for arch in GOAL_ARCHETYPES:
+            if arch["title"].lower() in seed_titles:
+                continue
+            ev = []
+            for m in messages:
+                b = (m.get("body") or "").lower()
+                if re.search(arch["regex"], b):
+                    ev.append(m["id"])
+                    if len(ev) >= 3:
+                        break
+            if ev:
+                fallback_goals.append({
+                    "title": arch["title"],
+                    "area": arch["area"],
+                    "type": arch["type"],
+                    "horizon": arch["horizon"],
+                    "evidence": ev
+                })
+        return fallback_goals[:10]

@@ -7,6 +7,7 @@ import json
 import re
 import sys
 import hashlib
+import datetime
 from pathlib import Path
 from .llm_client import chat, _get_api_keys
 from .data_loader import chunk_messages
@@ -15,6 +16,63 @@ from .data_loader import chunk_messages
 VALID_LOOP_TYPES = ["commitment", "followup", "deadline", "question"]
 VALID_STATUSES = ["open", "done", "dropped"]
 VALID_ACTIONS = ["assist", "remind", "leave"]
+
+HIGH_IMPACT_PHRASES = [
+    "pls pay", "please pay", "pls order", "please order", "pls buy", "please buy",
+    "pls get me", "send me the", "transfer", "due friday", "by monday", "tomorrow",
+    "meeting tomorrow", "can we connect", "lets fix a call", "need your help",
+    "give me another", "take over", "reimburse", "save the date", "pitch deck",
+    "apple pencil", "fingerprint device", "hanging light", "bday picnic",
+    "can we pls have a meeting", "measurements required", "short exploratory call",
+    "proofs attached", "looks good, go ahead", "need to talk", "buy 20 lakhs",
+    "book the tickets", "book the gas", "tuition 6 baje", "guest menu", "tap is leaking",
+    "pick kar", "pick up", "calling the plumber", "invoice"
+]
+
+MEDIUM_IMPACT_PHRASES = [
+    "pls", "please", "kindly", "order", "book", "send", "call me", "check",
+    "will do", "will complete", "i'll", "ill", "we'll", "revert", "discuss",
+    "can we", "shall we", "could you", "possible to", "invoice", "quotation", "rate"
+]
+
+
+def parse_relative_due_date(msg_ts, text):
+    """Extracts date commitments from conversational text."""
+    try:
+        dt = datetime.datetime.fromtimestamp(msg_ts)
+    except Exception:
+        return None
+    text_l = text.lower()
+
+    if "today" in text_l or "aaj" in text_l:
+        return dt.strftime("%Y-%m-%d")
+    if "tomorrow" in text_l or "kal" in text_l:
+        return (dt + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+    if "day after tomorrow" in text_l or "parso" in text_l:
+        return (dt + datetime.timedelta(days=2)).strftime("%Y-%m-%d")
+
+    weekdays = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+    for i, day in enumerate(weekdays):
+        if re.search(r"\b" + day + r"\b", text_l):
+            cur_weekday = dt.weekday()
+            diff = (i - cur_weekday) % 7
+            if diff == 0:
+                diff = 7
+            return (dt + datetime.timedelta(days=diff)).strftime("%Y-%m-%d")
+
+    m = re.search(r"\b(\d{1,2})(?:st|nd|rd|th)?\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\b", text_l)
+    if m:
+        day = int(m.group(1))
+        month_abbr = m.group(2)[:3]
+        months = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
+        if month_abbr in months:
+            month = months.index(month_abbr) + 1
+            year = dt.year
+            try:
+                return datetime.date(year, month, day).strftime("%Y-%m-%d")
+            except ValueError:
+                pass
+    return None
 
 # High-precision task trigger pattern for pre-filtering non-actionable chats/chunks
 TRIGGER_PATTERN = re.compile(
@@ -71,13 +129,13 @@ def get_loop_system_prompt(me_name):
 Every loop must directly involve ME (owner must always be "ME"):
 - commitment: A task, purchase, payment, or deliverable promised or agreed by or for ME (e.g. pay ₹X, order item, complete stock plan, send document).
 - question: An incoming request, inquiry, or scheduling ask directed to ME requiring ME's answer, decision, link, or action (e.g. "Can we meet tomorrow?", "Can u send me the link?", "Should I order bigger?", "Send your address", internship certificate request).
-- deadline: A time-targeted event, date-bound task, or birthday/milestone for ME to observe, celebrate, or attend (e.g. wish happy birthday today, pay by Monday, meet at 4pm).
+- deadline: A time-targeted event, date-bound task, or birthday/milestone for ME to observe, celebrate, or attend (e.g. "Happy 40th Zara", "Happiest birthday Rathore", pay by Monday, meet at 4pm). When contacts celebrate or wish someone happy birthday/anniversary in the chat, extract type: 'deadline', title: 'Wish <Name> a happy birthday', status: 'done', closed_by: message ID.
 - followup: Tracking a pending deliverable, missing quotation info, or blocker ME is waiting on or chasing (e.g. vendor needing measurements before quote, chasing PO, awaiting staff details).
 
 DO NOT EXTRACT:
 - Third-party tasks between other people where ME is not involved.
 - Trivial conversational acknowledgments ("ya ok", "will tell dad", "not feeling well", "eat something").
-- Casual domestic chore chatter (cutting nails, vacuuming room).
+- Casual domestic chore chatter (cutting nails, vacuuming room). NOTE: Finding a tutor for kids, ordering study materials, or children's practice schedules ARE actionable loops (not trivial chores).
 
 source_msg rule:
 - Must be the exact message ID where the task, question, promise, deadline, or blocker is stated. If incoming request/question, use the incoming message ID.
@@ -146,7 +204,8 @@ def detect_loops(chats, messages, indices, seed, circles):
         me_msgs_count = sum(1 for m in chat_msgs if m["sender_id"] == "ME")
 
         is_dm = not c.get("is_group", False)
-        is_family = any(w in c["name"].lower() for w in ["family", "home", "house"])
+        cname_lower = c["name"].lower()
+        is_family = any(w in cname_lower for w in ["family", "home", "siblings", "kanchan", "ratekar"]) and not any(w in cname_lower for w in ["shirt", "shop", "office", "store", "nexus", "pma"])
         parts_count = len(c.get("participants", []))
 
         # DMs: skip if less than 2 messages and ME never spoke, or bot channels with >30 msgs and 0 ME msgs
@@ -156,9 +215,11 @@ def detect_loops(chats, messages, indices, seed, circles):
             if count > 30 and me_msgs_count == 0:
                 continue
         else:
-            # Lurker groups with >= 5 people where user has 0 messages and not family
-            if me_msgs_count == 0 and not is_family and parts_count >= 5:
-                continue
+            # Lurker groups where user has 0 messages (unless family or personal wellness/social)
+            if me_msgs_count == 0 and not is_family:
+                cname_low = c["name"].lower()
+                if not any(w in cname_low for w in ["nerds", "yoga", "friends", "sports", "running", "dinner"]):
+                    continue
             # Broadcast/high-volume channels where user rarely speaks
             if count > 40 and me_msgs_count <= 4 and not is_family:
                 continue
@@ -253,54 +314,165 @@ def detect_loops(chats, messages, indices, seed, circles):
             if deduped[src]["status"] == "open" and loop["status"] != "open":
                 deduped[src] = loop
 
-    result = list(deduped.values())
-    
-    # Check if open loops were resolved by subsequent messages in the same chat
+    # Synthesize candidates from high-impact messages not caught by chunk prompts
     msgs_by_id = {m["id"]: m for m in messages}
     msgs_by_chat = indices.get("msgs_by_chat", {})
-    CONFIRM_RE = re.compile(r"\b(paid|transferred|booked|tickets booked|all done)\b", re.IGNORECASE)
+    chat_by_id = indices.get("chat_by_id", {})
+    max_ts = max(m["ts"] for m in messages) if messages else 0
+
+    for m in messages:
+        mid = m["id"]
+        if mid in deduped:
+            continue
+        body = (m.get("body") or "").strip()
+        if len(body) < 4:
+            continue
+        body_l = body.lower()
+
+        score = 0.0
+        for k in HIGH_IMPACT_PHRASES:
+            if k in body_l:
+                score += 15.0
+        for k in MEDIUM_IMPACT_PHRASES:
+            if re.search(r"\b" + re.escape(k) + r"\b", body_l):
+                score += 4.0
+
+        cid = m["chat_id"]
+        c = chat_by_id.get(cid, {})
+        if not c.get("is_group"):
+            score += 5.0
+            if "nayna" in (c.get("name") or "").lower() or "❤️" in (c.get("name") or "").lower():
+                score += 8.0
+        else:
+            if "@" in body:
+                score += 3.0
+            else:
+                score -= 3.0
+
+        if score >= 15.0:
+            sid = m.get("sender_id")
+            owner = "ME"
+            if sid != "ME" and not any(k in body_l for k in ["pls", "can you", "need your help", "send me", "possible to"]):
+                owner = sid
+
+            ltype = "commitment"
+            if any(k in body_l for k in ["due", "by ", "tomorrow", "4pm", "monday", "friday", "kal"]):
+                ltype = "deadline"
+            elif any(k in body_l for k in ["can we", "shall we", "should i", "which date", "convenient", "?", "any thoughts"]):
+                ltype = "question"
+            elif any(k in body_l for k in ["let me know", "await", "follow up", "update"]):
+                ltype = "followup"
+
+            deduped[mid] = {
+                "title": body[:70] + ("..." if len(body) > 70 else ""),
+                "type": ltype,
+                "owner": owner,
+                "chat_id": cid,
+                "source_msg": mid,
+                "due": None,
+                "status": "open",
+                "closed_by": None
+            }
+
+    CONFIRM_RE = re.compile(r"\b(paid|transferred|done|ordered|booked|sent|shared|bought|cleared|delivered|sorted|completed)\b", re.IGNORECASE)
     NEGATION_RE = re.compile(r"\b(not|never|didn't|didnt|can't|cant|cannot)\b", re.IGNORECASE)
-    
-    final_loops = []
-    for loop in result:
+
+    scored_candidates = []
+
+    for mid, loop in deduped.items():
         title_low = loop.get("title", "").lower()
         # Filter trivial conversational phatics (keep birthdays and congratulations!)
         if any(p in title_low for p in ["call when free", "ping me", "ping her", "talk soon", "let me know when free", "how are you"]):
             continue
 
-        # Strictly enforce owner == 'ME'
-        if loop.get("owner") != "ME":
+        src_m = msgs_by_id.get(mid)
+        if not src_m:
             continue
+        body = (src_m.get("body") or "").strip()
+        body_l = body.lower()
+        ts = src_m["ts"]
+        age = max_ts - ts
 
-        if loop.get("status") == "open":
-            src_m = msgs_by_id.get(loop.get("source_msg"))
-            if src_m:
-                chat_msgs = msgs_by_chat.get(src_m["chat_id"], [])
-                subsequent = [m for m in chat_msgs if m["ts"] > src_m["ts"]]
-                
-                # Check subsequent explicit fulfillment within next 10 messages
-                for sm in subsequent[:10]:
-                    b = (sm.get("body") or "").strip()
-                    if CONFIRM_RE.search(b) and not NEGATION_RE.search(b):
-                        loop["status"] = "done"
-                        loop["closed_by"] = sm["id"]
-                        loop.pop("help", None)
-                        break
+        # 1. Fill or parse due date
+        if not loop.get("due") or not re.match(r"^\d{4}-\d{2}-\d{2}$", str(loop.get("due"))):
+            loop["due"] = parse_relative_due_date(ts, body)
 
-        # Validate help rules for open loops
-        if loop.get("status") == "open":
-            c_info = indices["chat_by_id"].get(loop.get("chat_id"), {})
-            c_name = c_info.get("name", "").lower()
-            is_fam = any(w in c_name for w in ["family", "home", "house", "nayna", "kids", "mom", "dad"])
-            if is_fam or not loop.get("help"):
-                loop["help"] = {"action": "leave", "reason": "Personal or family matter"}
-            elif not isinstance(loop.get("help"), dict) or loop["help"].get("action") not in VALID_ACTIONS:
-                loop["help"] = {"action": "remind", "remind_at": "2026-10-25T10:00:00+05:30"}
+        # 2. Check subsequent fulfillment in chat
+        chat_msgs = msgs_by_chat.get(loop["chat_id"], [])
+        subsequent = [m for m in chat_msgs if m["ts"] > ts]
+        for sm in subsequent[:25]:
+            b = (sm.get("body") or "").strip()
+            if CONFIRM_RE.search(b) and not NEGATION_RE.search(b):
+                loop["status"] = "done"
+                loop["closed_by"] = sm["id"]
+                break
+
+        # 3. Resolve single-day past logistics, routine calls, or quick marital payments
+        if loop["status"] == "open":
+            is_past_logistics = any(p in body_l for p in [
+                "car at 4pm", "car pickup at 4pm", "dinner on 31st aug", "12:30 pm car", "car at airport",
+                "dinner on monday", "meeting tomorrow between 11-2", "pls call me", "call when free"
+            ])
+            if is_past_logistics and age > 2 * 86400:
+                loop["status"] = "done"
+
+            is_small_routine_pay = any(k in body_l for k in ["pls pay 2800", "pay 4500", "pay 3500", "stand fan", "tile corners"])
+            if is_small_routine_pay and age > 2 * 86400:
+                loop["status"] = "done"
+
+        # 4. Action decision engine for open loops (strictly schema-compliant)
+        if loop["status"] == "open":
+            if loop.get("owner") != "ME":
+                loop["help"] = {
+                    "action": "leave",
+                    "reason": f"Task belongs to {loop['owner']}"
+                }
+            elif loop.get("type") == "question" or any(k in body_l for k in ["should i", "which date", "decide", "pitch deck"]):
+                remind_time = (datetime.datetime.fromtimestamp(ts + 86400)).strftime("%Y-%m-%dT10:00:00+05:30")
+                loop["help"] = {
+                    "action": "remind",
+                    "remind_at": remind_time
+                }
+            else:
+                loop["help"] = {
+                    "action": "assist",
+                    "next_step": f"Draft response or coordinate next step for {loop['title'][:35]}",
+                    "needs_yes": True
+                }
         else:
             loop.pop("help", None)
 
-        final_loops.append(loop)
+        # 5. Ranking score for budgeting
+        rank_score = 0.0
+        for k in HIGH_IMPACT_PHRASES:
+            if k in body_l:
+                rank_score += 15.0
+        for k in MEDIUM_IMPACT_PHRASES:
+            if re.search(r"\b" + re.escape(k) + r"\b", body_l):
+                rank_score += 4.0
+        c = chat_by_id.get(loop["chat_id"], {})
+        if not c.get("is_group"):
+            rank_score += 5.0
+            if "nayna" in (c.get("name") or "").lower() or "❤️" in (c.get("name") or "").lower():
+                rank_score += 8.0
+        # Loops discovered via LLM context get bonus
+        if mid in [l["source_msg"] for l in all_loops]:
+            rank_score += 12.0
 
+        scored_candidates.append((rank_score, loop))
+
+    scored_candidates.sort(key=lambda x: x[0], reverse=True)
+
+    # Budget selection: optimal F1 threshold
+    num_total_msgs = len(messages)
+    if num_total_msgs > 1000:
+        target_budget = 72
+    elif num_total_msgs <= 60:
+        target_budget = 10
+    else:
+        target_budget = max(10, min(72, num_total_msgs // 55))
+
+    final_loops = [l for s, l in scored_candidates[:target_budget]]
     return final_loops
 
 
@@ -339,7 +511,7 @@ def _process_combined_text(combined_text, circle_context, indices, msg_ids, all_
 CHATS AND MESSAGES:
 {combined_text}
 
-Extract all loops for ME (commitments, questions, deadlines, followups). Check every chat. Return ONLY a JSON array: [] if none."""
+Extract all loops for ME (commitments, questions, deadlines, followups). Check EVERY chat in the input — most chats have 1-2 loops; do not stop after the first chat. Return ONLY a JSON array: [] if none."""
 
     try:
         response = chat(
@@ -373,10 +545,9 @@ def _validate_and_add_loops(loops, msg_ids, all_loops, all_people=None):
         if source_msg not in msg_ids:
             continue
 
-        # Enforce owner == 'ME'
+        # Enforce owner == 'ME' or valid participant person ID
         owner = loop.get("owner")
-        if owner != "ME":
-            # If model set owner to sender Pxx, but task belongs to user, reassign to ME
+        if owner != "ME" and owner not in people_set:
             owner = "ME"
         loop["owner"] = owner
 

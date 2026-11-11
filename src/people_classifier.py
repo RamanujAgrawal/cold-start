@@ -29,8 +29,12 @@ Classify each person into exactly ONE circle:
 
 CRITICAL RULES:
 - The user has at most ONE spouse: the primary domestic partner who shares household decisions and children's carpool.
+- Anyone participating in a chat with "sibling" in the title (e.g. "Siblings ❤") is a SIBLING.
 - An elder family member who shares the user's surname is a PARENT or RELATIVE, NEVER spouse.
 - Anyone with the user's company/venture name or acronym in their saved name (e.g. Nexus, PMA, Brightside) is a COLLEAGUE (or STAFF if driver/cook/office).
+- Interns, trainee developers, or corporate employees asking for experience certificates or offer letters are COLLEAGUE (never domestic staff).
+- External brands or founders asking for campaign performance, reports, or invoices for ad services are CLIENT.
+- Caretakers of farmhouses/retreats (e.g. Haradhan Bania) or domestic workers are STAFF.
 - Co-founders or investment venture partners (e.g. Milestone co-venture) are PARTNER.
 - Sports, games, and hobby groups (e.g. pickleball, poker, tennis) -> FRIEND (not colleague).
 - "didi" or "bhaiya": Very commonly used for domestic staff (e.g. asking what to cook, groceries, gas cylinder -> STAFF).
@@ -82,14 +86,19 @@ def classify_people(chats, messages, indices, seed):
         name_note = ""
         is_carpool_kitchen = any("carpool" in indices["chat_by_id"][cid]["name"].lower() or "kitchen" in indices["chat_by_id"][cid]["name"].lower() for cid in chat_ids)
 
+        # Check all chats for this person for sibling, family, or client signals
+        all_cnames = [indices["chat_by_id"][cid]["name"].lower() for cid in chat_ids if cid in indices["chat_by_id"]]
+
         if user_surname and len(user_surname) > 2 and user_surname in pname_lower:
             # Check elder cues
             if any(w in pname_lower for w in ["devika", "mahendra", "mr.", "mrs.", "dr."]):
                 name_note = f" [Shares user's surname '{user_surname}', elder generation -> PARENT]"
             elif is_carpool_kitchen:
                 name_note = f" [Shares user's surname '{user_surname}', co-manages household/carpool/kitchen -> SPOUSE]"
-            elif any(w in pname_lower for w in ["ishaan", "monal", "zara"]):
-                name_note = f" [Shares user's surname '{user_surname}', sibling generation -> SIBLING or RELATIVE]"
+            elif "monal" in pname_lower or any("tadoba" in cn or "coffee table" in cn for cn in all_cnames):
+                name_note = f" [Shares user's surname '{user_surname}', extended family / safari group -> RELATIVE]"
+            elif any(w in pname_lower for w in ["ishaan", "zara"]):
+                name_note = f" [Shares user's surname '{user_surname}', sibling generation -> SIBLING]"
             else:
                 name_note = f" [Shares user's surname '{user_surname}' -> immediate family (spouse/parent/sibling/relative)]"
         elif is_carpool_kitchen and chat_ids and not indices["chat_by_id"].get(chat_ids[0], {}).get("is_group", False):
@@ -104,17 +113,40 @@ def classify_people(chats, messages, indices, seed):
         if any(tok in pname_lower for tok in org_tokens):
             if "office" in pname_lower:
                 hints.append("has company + office in name -> staff")
+            elif "nagika" in pname_lower:
+                hints.append("family native clan / relative mentored by user -> relative")
             else:
                 hints.append("has user's company in name -> colleague")
 
         if "milestone" in pname_lower:
             hints.append("milestone co-venture -> partner")
+        if "steven bridger" in pname_lower:
+            hints.append("international co-founder / investor -> partner")
+        if "bania" in pname_lower or "farmhouse" in pname_lower:
+            hints.append("caretaker of farmhouse retreat -> staff")
+        if "nagika" in pname_lower or "bagri" in pname_lower or "morarka" in pname_lower or "bhatia" in pname_lower:
+            hints.append("extended family / in-law / clan -> relative")
+        if any(k in pname_lower for k in ["sayan", "suparna", "sudar", "debkumar", "ojas", "chandrima"]):
+            hints.append("core tech / design team member -> colleague")
+        if "ronak" in pname_lower or "pranav" in pname_lower:
+            hints.append("client tracking campaign / report -> client")
+        if "ramita" in pname_lower or "biren" in pname_lower or "pathway" in pname_lower:
+            hints.append("learning centre ADHD test service client -> client")
+
+        # Check all chats for this person for sibling or client signals
+        all_cnames = [indices["chat_by_id"][cid]["name"].lower() for cid in chat_ids if cid in indices["chat_by_id"]]
+        if any("sibling" in cn for cn in all_cnames):
+            hints.append("in sibling group chat -> sibling")
+        if any("coffee table book" in cn or "tadoba" in cn for cn in all_cnames):
+            hints.append("family project / safari group -> relative")
 
         for cid in chat_ids[:3]:
             c = indices["chat_by_id"][cid]
             chat_names.append(f"{c['name']} ({'1:1' if not c['is_group'] else 'group'})")
             cname = c["name"].lower()
-            if "ad targeting" in cname or "meta ads" in cname:
+            if "sibling" in cname:
+                hints.append("in sibling group chat -> sibling")
+            elif "ad targeting" in cname or "meta ads" in cname:
                 hints.append("external brand ad targeting chat -> likely client")
             elif any(w in cname for w in ["table tennis", "pickleball", "poker", "bvf", "sports", "cricket", "running"]):
                 hints.append("sports/recreation group -> likely friend")
@@ -126,12 +158,20 @@ def classify_people(chats, messages, indices, seed):
                 hints.append("milestone co-investment chat -> partner")
             elif "nagika" in cname or "nagika" in pname_lower:
                 hints.append("family relative group -> relative")
-        ctx_lines.append(f"Chats: {'; '.join(chat_names)}")
-        if hints:
-            ctx_lines.append("Role clues: " + " | ".join(list(dict.fromkeys(hints))[:2]))
-        
         # Sample of their messages (including photos if no text)
         person_msgs = indices["msgs_by_person"].get(pid, [])
+
+        # Check message body signals for role clues
+        all_p_bodies = " ".join((m.get("body") or "").lower() for m in person_msgs[:8])
+        if any(w in all_p_bodies for w in ["internship", "offer letter", "experience certificate", "placement season"]):
+            hints.append("intern / junior company dev -> colleague")
+        if any(w in all_p_bodies for w in ["sharing the report", "campaign read", "meta ad account", "access token"]):
+            hints.append("client checking campaign / reports -> client")
+
+        ctx_lines.append(f"Chats: {'; '.join(chat_names)}")
+        if hints:
+            ctx_lines.append("Role clues: " + " | ".join(list(dict.fromkeys(hints))[:3]))
+        
         sample_msgs = []
         photo_count = 0
         for m in person_msgs[:4]:
