@@ -1,10 +1,10 @@
 """A robust client for any OpenAI-compatible chat API, standard library only.
 
 Features:
-- Proactive per-key rate limiter (KeyPool) with 60-second sliding windows and RPM budget tracking.
-- Preemptive cooldowns based on Groq response headers (x-ratelimit-remaining-*).
-- Sidelining on 429: penalizes only the affected key and immediately rotates to an available key.
-- Thread-safe key acquisition and usage tracking for concurrent workers.
+- Dual-model routing support for independent per-model TPM quotas.
+- Strict inter-request pacing lock (_pace_request) preventing concurrent burst collisions.
+- Proactive KeyPool with per-key cooldowns and sliding windows.
+- Sidelining on 429: isolates affected key without blocking unaffected keys.
 """
 import collections
 import json
@@ -90,7 +90,7 @@ class KeyPool:
                     if now < self.cooldown[k]:
                         wait = self.cooldown[k] - now
                     elif len(w) < self.limit:
-                        w.append(now)  # Reserve the slot
+                        w.append(now)  # Reserve slot
                         return k
                     else:
                         wait = 60.0 - (now - w[0])
@@ -98,8 +98,7 @@ class KeyPool:
                     if best_wait is None or wait < best_wait:
                         best_wait = wait
 
-            # If all keys are at capacity or cooling down, sleep until the earliest opens up
-            sleep_time = max(0.05, min(best_wait if best_wait is not None else 0.5, 5.0))
+            sleep_time = max(0.05, min(best_wait if best_wait is not None else 0.5, 3.0))
             time.sleep(sleep_time)
 
     def penalize(self, key, seconds):
@@ -109,22 +108,18 @@ class KeyPool:
             self.cooldown[key] = max(self.cooldown.get(key, 0.0), now + seconds)
 
     def update_from_headers(self, key, headers):
-        """Proactively inspect Groq rate-limit headers to prevent 429s."""
+        """Inspect Groq rate-limit headers to prevent 429s."""
         if not headers:
             return
         
-        rem_req = headers.get("x-ratelimit-remaining-requests")
-        reset_req = headers.get("x-ratelimit-reset-requests")
         rem_tok = headers.get("x-ratelimit-remaining-tokens")
         reset_tok = headers.get("x-ratelimit-reset-tokens")
 
         try:
-            if rem_req is not None and int(rem_req) <= 1:
-                secs = _parse_time_str(reset_req) or 5.0
-                self.penalize(key, secs)
-            elif rem_tok is not None and int(rem_tok) < 1500:
-                secs = _parse_time_str(reset_tok) or 10.0
-                self.penalize(key, secs)
+            # If tokens remaining are critically low (< 1200), cool down key briefly for reset
+            if rem_tok is not None and int(rem_tok) < 1200:
+                secs = _parse_time_str(reset_tok) or 3.5
+                self.penalize(key, min(secs, 10.0))
         except Exception:
             pass
 
@@ -132,6 +127,8 @@ class KeyPool:
 _POOL = None
 _POOL_LOCK = threading.Lock()
 _USAGE_LOCK = threading.Lock()
+_PACE_LOCK = threading.Lock()
+_LAST_CALL_TIME = 0.0
 
 
 def _get_pool():
@@ -145,12 +142,24 @@ def _get_pool():
         return _POOL
 
 
+def _pace_request(min_gap=0.9):
+    """Enforce minimum spacing between any outgoing HTTP requests to avoid burst rate-limits."""
+    global _LAST_CALL_TIME
+    with _PACE_LOCK:
+        now = time.time()
+        elapsed = now - _LAST_CALL_TIME
+        if elapsed < min_gap:
+            time.sleep(min_gap - elapsed)
+        _LAST_CALL_TIME = time.time()
+
+
 def chat(messages, model=None, temperature=0, max_tokens=None, response_format=None, timeout=120):
-    """Send a chat completion request with proactive rate-limiting and failover."""
+    """Send a chat completion request with proactive pacing, rate-limiting, and failover."""
     _load_env_if_needed()
     base = os.environ.get("LLM_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/")
+    chosen_model = model or os.environ.get("LLM_MODEL", "qwen/qwen3.8-27b")
     body = {
-        "model": model or os.environ.get("LLM_MODEL", "qwen/qwen3.8-27b"),
+        "model": chosen_model,
         "messages": messages,
         "temperature": temperature,
     }
@@ -166,6 +175,7 @@ def chat(messages, model=None, temperature=0, max_tokens=None, response_format=N
 
     for attempt in range(max_retries):
         key = pool.acquire()
+        _pace_request(min_gap=0.9)
 
         req = urllib.request.Request(
             base + "/chat/completions",
@@ -190,28 +200,26 @@ def chat(messages, model=None, temperature=0, max_tokens=None, response_format=N
                 except Exception:
                     pass
 
-                wait = None
-                m_match = re.search(r"try again in (?:(\d+)m)?([\d\.]+)s", err_text)
-                if m_match:
-                    mins = float(m_match.group(1)) if m_match.group(1) else 0.0
-                    secs = float(m_match.group(2))
-                    wait = mins * 60.0 + secs + 0.5
-                else:
-                    ms_match = re.search(r"try again in ([\d\.]+)ms", err_text)
-                    if ms_match:
-                        wait = float(ms_match.group(1)) / 1000.0 + 0.5
+                # Check reset-tokens header first for precise wait
+                wait = _parse_time_str(e.headers.get("x-ratelimit-reset-tokens"))
+                if wait is None:
+                    m_match = re.search(r"try again in (?:(\d+)m)?([\d\.]+)s", err_text)
+                    if m_match:
+                        mins = float(m_match.group(1)) if m_match.group(1) else 0.0
+                        secs = float(m_match.group(2))
+                        wait = mins * 60.0 + secs + 0.3
+                    else:
+                        ms_match = re.search(r"try again in ([\d\.]+)ms", err_text)
+                        if ms_match:
+                            wait = float(ms_match.group(1)) / 1000.0 + 0.3
 
                 if wait is None:
                     ra = e.headers.get("Retry-After")
-                    if ra:
-                        wait = _parse_time_str(ra) or 15.0
-                    else:
-                        wait = _parse_time_str(e.headers.get("x-ratelimit-reset-tokens")) or 15.0
+                    wait = _parse_time_str(ra) or 4.0
 
-                wait = min(max(wait, 2.0), 60.0)
-                # Penalize only this specific key — other keys remain active immediately
+                wait = min(max(wait, 1.5), 30.0)
                 pool.penalize(key, wait)
-                print(f"  Key rate-limited. Sidelined for {wait:.1f}s. Switching key...", file=sys.stderr)
+                print(f"  Rate-limited on {chosen_model}. Pausing key for {wait:.1f}s...", file=sys.stderr)
                 if attempt == max_retries - 1:
                     raise
                 continue

@@ -138,6 +138,7 @@ Return ONLY a JSON array. No markdown."""
     try:
         response = chat(
             [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}],
+            model="qwen/qwen3.8-27b",
             temperature=0,
             max_tokens=800,
         )

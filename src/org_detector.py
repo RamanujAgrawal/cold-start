@@ -129,6 +129,7 @@ Return ONLY a JSON object:
     try:
         response = chat(
             [{"role": "user", "content": prompt}],
+            model="qwen/qwen3.8-27b",
             temperature=0,
             max_tokens=2200,
         )

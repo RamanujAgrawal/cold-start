@@ -157,11 +157,10 @@ def classify_people(chats, messages, indices, seed):
         
         person_contexts[pid] = "\n".join(ctx_lines)
     
-    # Batch classify — send 12 people per LLM call
-    batch_size = 12
+    # Batch classify — send 18 people per LLM call
+    batch_size = 18
     batches = [unclassified[i:i + batch_size] for i in range(0, len(unclassified), batch_size)]
-    keys = _get_api_keys()
-    num_workers = min(max(1, len(keys)), 5)
+    num_workers = 2
     me_name = indices.get("me_name", "User")
 
     seed_context = ""
@@ -183,6 +182,7 @@ Valid circles: {VALID_CIRCLES}"""
         try:
             response = chat(
                 [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}],
+                model="qwen/qwen3.8-27b",
                 temperature=0,
                 max_tokens=600,
             )

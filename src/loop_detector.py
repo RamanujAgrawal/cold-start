@@ -135,26 +135,29 @@ def detect_loops(chats, messages, indices, seed, circles):
         is_family = any(w in c["name"].lower() for w in ["family", "home", "house"])
         parts_count = len(c.get("participants", []))
 
-        # Skip large broadcast / community lurker channels where user has sent 0 messages
-        if not is_dm and me_msgs_count == 0 and not is_family and parts_count >= 8:
-            continue
-        # Skip automated / broadcast channels where user rarely or never participates
-        if not is_dm and count > 40 and me_msgs_count <= 5 and not is_family:
-            continue
-        if is_dm and count > 30 and me_msgs_count == 0:
-            continue
+        # DMs: skip if less than 2 messages and ME never spoke
+        if is_dm:
+            if count < 2 and me_msgs_count == 0:
+                continue
+        else:
+            # Lurker groups with >= 5 people where user has 0 messages and not family
+            if me_msgs_count == 0 and not is_family and parts_count >= 5:
+                continue
+            # Broadcast/high-volume channels where user rarely speaks
+            if count > 40 and me_msgs_count <= 4 and not is_family:
+                continue
 
         # Check if chat contains any actionable trigger keywords
         all_text = " ".join((m.get("body") or "") for m in chat_msgs)
         if not TRIGGER_PATTERN.search(all_text):
             continue
 
-        if count > 35:
+        if count > 50:
             large_chats.append(cid)
         else:
             current_small_group.append(cid)
             current_small_count += count
-            if current_small_count >= 28:
+            if current_small_count >= 40:
                 small_chat_groups.append(current_small_group)
                 current_small_group = []
                 current_small_count = 0
@@ -175,7 +178,7 @@ def detect_loops(chats, messages, indices, seed, circles):
         ]
         circle_ctx = f"People: {', '.join(chat_parts[:12])}" if chat_parts else ""
 
-        chunks = chunk_messages(chat_msgs, chunk_size=40, overlap=6)
+        chunks = chunk_messages(chat_msgs, chunk_size=60, overlap=10)
         for i, chunk in enumerate(chunks):
             chunk_text = " ".join((m.get("body") or "") for m in chunk)
             if not TRIGGER_PATTERN.search(chunk_text):
@@ -216,8 +219,7 @@ def detect_loops(chats, messages, indices, seed, circles):
             _process_combined_text(combined_text, group_circle_context, indices, msg_ids, local_loops, sys_prompt)
         return local_loops
 
-    keys = _get_api_keys()
-    num_workers = min(max(1, len(keys)), 5)
+    num_workers = 2
     print(f"  Executing {len(tasks)} loop tasks using {num_workers} concurrent workers...", file=sys.stderr)
     with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
         for partial in executor.map(_execute_loop_task, tasks):
@@ -310,6 +312,7 @@ Extract all loops (commitments, followups, deadlines, questions) — both OPEN a
     try:
         response = chat(
             [{"role": "system", "content": sys_prompt}, {"role": "user", "content": prompt}],
+            model="qwen/qwen3.8-27b",
             temperature=0,
             max_tokens=800,
         )
@@ -331,6 +334,7 @@ Extract all loops (commitments, followups, deadlines, questions) — both OPEN a
     try:
         response = chat(
             [{"role": "system", "content": sys_prompt}, {"role": "user", "content": prompt}],
+            model="qwen/qwen3.8-27b",
             temperature=0,
             max_tokens=800,
         )
