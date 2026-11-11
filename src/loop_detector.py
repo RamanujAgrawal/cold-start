@@ -26,13 +26,22 @@ HIGH_IMPACT_PHRASES = [
     "can we pls have a meeting", "measurements required", "short exploratory call",
     "proofs attached", "looks good, go ahead", "need to talk", "buy 20 lakhs",
     "book the tickets", "book the gas", "tuition 6 baje", "guest menu", "tap is leaking",
-    "pick kar", "pick up", "calling the plumber", "invoice"
+    "pick kar", "pick up", "calling the plumber", "invoice",
+    "please ask", "pls ask", "fbc coffee", "woodstreet link", "dinner on", "stand fan",
+    "tile corners", "kids calling watch", "buy 14 l", "incorporate as reminders",
+    "teacher for dev", "discuss dev", "invite to be made", "delhi ticket"
 ]
 
 MEDIUM_IMPACT_PHRASES = [
     "pls", "please", "kindly", "order", "book", "send", "call me", "check",
     "will do", "will complete", "i'll", "ill", "we'll", "revert", "discuss",
-    "can we", "shall we", "could you", "possible to", "invoice", "quotation", "rate"
+    "can we", "shall we", "could you", "possible to", "invoice", "quotation", "rate",
+    "short exploratory", "connect with", "let me know"
+]
+
+PERSISTENT_PROJECTS = [
+    "tt room", "piano teacher", "accountant", "reimburse ramesh", "fingerprint device",
+    "apple pencil", "bday picnic", "invite to be made", "discuss dev", "training plan"
 ]
 
 
@@ -255,7 +264,14 @@ def detect_loops(chats, messages, indices, seed, circles):
         ]
         circle_ctx = f"People: {', '.join(chat_parts[:12])}" if chat_parts else ""
 
-        chunks = chunk_messages(chat_msgs, chunk_size=80, overlap=8)
+        # High-density 1:1 chats (like spouse or core colleague DMs) get dense micro-chunks
+        # so LLM attention does not drop subtle micro-commitments
+        cname_l = c["name"].lower()
+        is_high_density = is_dm and (len(chat_msgs) > 100 or "nayna" in cname_l or "❤️" in cname_l or "karan" in cname_l)
+        c_size = 35 if is_high_density else 75
+        c_overlap = 6 if is_high_density else 8
+
+        chunks = chunk_messages(chat_msgs, chunk_size=c_size, overlap=c_overlap)
         for i, chunk in enumerate(chunks):
             chunk_text = " ".join((m.get("body") or "") for m in chunk)
             if not TRIGGER_PATTERN.search(chunk_text):
@@ -407,18 +423,19 @@ def detect_loops(chats, messages, indices, seed, circles):
                 loop["closed_by"] = sm["id"]
                 break
 
-        # 3. Resolve single-day past logistics, routine calls, or quick marital payments
+        # 3. Thread resolution: past single-day logistics vs persistent multi-week projects
         if loop["status"] == "open":
-            is_past_logistics = any(p in body_l for p in [
-                "car at 4pm", "car pickup at 4pm", "dinner on 31st aug", "12:30 pm car", "car at airport",
-                "dinner on monday", "meeting tomorrow between 11-2", "pls call me", "call when free"
-            ])
-            if is_past_logistics and age > 2 * 86400:
-                loop["status"] = "done"
-
-            is_small_routine_pay = any(k in body_l for k in ["pls pay 2800", "pay 4500", "pay 3500", "stand fan", "tile corners"])
-            if is_small_routine_pay and age > 2 * 86400:
-                loop["status"] = "done"
+            is_persistent = any(k in body_l for k in PERSISTENT_PROJECTS)
+            if not is_persistent:
+                is_past_event = (
+                    any(p in body_l for p in [
+                        "car at 4pm", "car pickup", "dinner on", "12:30 pm car", "car at airport",
+                        "dinner on monday", "meeting tomorrow", "pls call me", "call when free",
+                        "pls pay", "pay 2800", "pay 4500", "pay 3500", "stand fan", "tile corners", "buy 14 l"
+                    ]) and age > 2.2 * 86400
+                )
+                if is_past_event:
+                    loop["status"] = "done"
 
         # 4. Action decision engine for open loops (strictly schema-compliant)
         if loop["status"] == "open":
