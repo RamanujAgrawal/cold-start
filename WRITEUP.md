@@ -50,7 +50,7 @@ WhatsApp Export (chats, messages, seed)
 ### Key Technical Innovations
 - **Localized Prompt Context:** Rather than injecting 280+ people into every prompt (which wastes 2,500+ tokens per call and causes LLM attention dilution), each chat chunk receives *only* the names and circles of its direct participants (~25 tokens).
 - **Signal-Gated Windowing:** Chunks with no actionable keywords (`TASK_SIGNALS`) and broadcast channels where Arjun never sends messages (e.g. `C05 mediadomain4`) are pruned before LLM invocation, saving over 35% of total API calls.
-- **Incremental Crash-Resilient Caching:** Loop chunk extraction caches every successful chunk to disk immediately, protecting against transient rate limits or timeout drops.
+- **Dual-Organization Token Bucket & Leaky Bucket Scheduler:** Routes requests dynamically across multiple API accounts to stay strictly within rate limits without disk caching, proactively spacing calls based on real token estimates.
 
 ---
 

@@ -110,7 +110,7 @@ def classify_people(chats, messages, indices, seed):
         if "milestone" in pname_lower:
             hints.append("milestone co-venture -> partner")
 
-        for cid in chat_ids[:5]:
+        for cid in chat_ids[:3]:
             c = indices["chat_by_id"][cid]
             chat_names.append(f"{c['name']} ({'1:1' if not c['is_group'] else 'group'})")
             cname = c["name"].lower()
@@ -134,33 +134,33 @@ def classify_people(chats, messages, indices, seed):
         person_msgs = indices["msgs_by_person"].get(pid, [])
         sample_msgs = []
         photo_count = 0
-        for m in person_msgs[:6]:
+        for m in person_msgs[:4]:
             body = (m.get("body") or "").strip()
             if body == "[photo]":
                 photo_count += 1
             elif body:
-                sample_msgs.append(body[:80])
+                sample_msgs.append(body[:50])
         if photo_count and not sample_msgs:
-            sample_msgs.append(f"[{photo_count} photos sent - property/maintenance/document]")
+            sample_msgs.append(f"[{photo_count} photos sent]")
         if sample_msgs:
-            ctx_lines.append("Their msgs: " + " | ".join(sample_msgs[:4]))
+            ctx_lines.append("Their msgs: " + " | ".join(sample_msgs[:2]))
         
         # Messages from ME in their 1:1 chat (if exists)
         for cid in chat_ids:
             c = indices["chat_by_id"][cid]
             if not c["is_group"]:
                 chat_msgs = indices["msgs_by_chat"].get(cid, [])
-                me_msgs = [m.get("body", "").strip()[:80] for m in chat_msgs if m["sender_id"] == "ME" and m.get("body")]
+                me_msgs = [m.get("body", "").strip()[:50] for m in chat_msgs if m["sender_id"] == "ME" and m.get("body")]
                 if me_msgs:
-                    ctx_lines.append("ME said: " + " | ".join(me_msgs[:2]))
+                    ctx_lines.append("ME said: " + " | ".join(me_msgs[:1]))
                 break
         
         person_contexts[pid] = "\n".join(ctx_lines)
     
-    # Batch classify — send 18 people per LLM call
-    batch_size = 18
+    # Batch classify — send 24 people per compact LLM call
+    batch_size = 24
     batches = [unclassified[i:i + batch_size] for i in range(0, len(unclassified), batch_size)]
-    num_workers = 2
+    num_workers = 1
     me_name = indices.get("me_name", "User")
 
     seed_context = ""

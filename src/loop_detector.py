@@ -135,9 +135,11 @@ def detect_loops(chats, messages, indices, seed, circles):
         is_family = any(w in c["name"].lower() for w in ["family", "home", "house"])
         parts_count = len(c.get("participants", []))
 
-        # DMs: skip if less than 2 messages and ME never spoke
+        # DMs: skip if less than 2 messages and ME never spoke, or bot channels with >30 msgs and 0 ME msgs
         if is_dm:
             if count < 2 and me_msgs_count == 0:
+                continue
+            if count > 30 and me_msgs_count == 0:
                 continue
         else:
             # Lurker groups with >= 5 people where user has 0 messages and not family
@@ -152,12 +154,12 @@ def detect_loops(chats, messages, indices, seed, circles):
         if not TRIGGER_PATTERN.search(all_text):
             continue
 
-        if count > 50:
+        if count > 60:
             large_chats.append(cid)
         else:
             current_small_group.append(cid)
             current_small_count += count
-            if current_small_count >= 40:
+            if current_small_count >= 70:
                 small_chat_groups.append(current_small_group)
                 current_small_group = []
                 current_small_count = 0
@@ -178,7 +180,7 @@ def detect_loops(chats, messages, indices, seed, circles):
         ]
         circle_ctx = f"People: {', '.join(chat_parts[:12])}" if chat_parts else ""
 
-        chunks = chunk_messages(chat_msgs, chunk_size=60, overlap=10)
+        chunks = chunk_messages(chat_msgs, chunk_size=80, overlap=8)
         for i, chunk in enumerate(chunks):
             chunk_text = " ".join((m.get("body") or "") for m in chunk)
             if not TRIGGER_PATTERN.search(chunk_text):
@@ -219,8 +221,9 @@ def detect_loops(chats, messages, indices, seed, circles):
             _process_combined_text(combined_text, group_circle_context, indices, msg_ids, local_loops, sys_prompt)
         return local_loops
 
-    num_workers = 2
-    print(f"  Executing {len(tasks)} loop tasks using {num_workers} concurrent workers...", file=sys.stderr)
+    stage5_keys = _get_api_keys(pool_name="stage5")
+    num_workers = min(len(stage5_keys), 2)
+    print(f"  Executing {len(tasks)} loop tasks using {num_workers} concurrent workers (pool=stage5, {len(stage5_keys)} keys)...", file=sys.stderr)
     with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
         for partial in executor.map(_execute_loop_task, tasks):
             all_loops.extend(partial)
@@ -314,7 +317,8 @@ Extract all loops (commitments, followups, deadlines, questions) — both OPEN a
             [{"role": "system", "content": sys_prompt}, {"role": "user", "content": prompt}],
             model="qwen/qwen3.8-27b",
             temperature=0,
-            max_tokens=800,
+            max_tokens=650,
+            pool_name="stage5",
         )
         loops = safe_parse_json_array(response)
         _validate_and_add_loops(loops, msg_ids, all_loops, indices["all_people"])
@@ -336,7 +340,8 @@ Extract all loops (commitments, followups, deadlines, questions) — both OPEN a
             [{"role": "system", "content": sys_prompt}, {"role": "user", "content": prompt}],
             model="qwen/qwen3.8-27b",
             temperature=0,
-            max_tokens=800,
+            max_tokens=650,
+            pool_name="stage5",
         )
         loops = safe_parse_json_array(response)
         _validate_and_add_loops(loops, msg_ids, all_loops, indices["all_people"])
