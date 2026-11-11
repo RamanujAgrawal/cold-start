@@ -56,9 +56,9 @@ def format_compact_window(msgs_window, is_dm=True, person_names=None):
         b_low = b.lower()
         if b_low in FILLER_WORDS:
             continue
-        # Truncate overly long bodies to max 85 chars
-        if len(b) > 85:
-            b = b[:82] + "..."
+        # Truncate overly long bodies to max 110 chars
+        if len(b) > 110:
+            b = b[:107] + "..."
         sid = m["sender_id"]
         mid = m["id"]
         lines.append(f"[{mid}] {sid}: {b}")
@@ -67,16 +67,30 @@ def format_compact_window(msgs_window, is_dm=True, person_names=None):
 
 def get_loop_system_prompt(me_name):
     """Generate concise system prompt dynamically adapted to the user."""
-    return f"""Extract all task loops (commitments, followups, deadlines, questions) from WhatsApp chats for user {me_name} (ID: ME) and other participants (Pxx).
-CRITICAL: Extract ALL substantive tasks/requests/promises across EVERY chat — whether owned by ME or Pxx, both OPEN and DONE/DROPPED.
+    return f"""Extract all open loops and tasks for {me_name} (ID: ME) from WhatsApp conversations.
+Every loop must directly involve ME (owner must always be "ME"):
+- commitment: A task, purchase, payment, or deliverable promised or agreed by or for ME (e.g. pay ₹X, order item, complete stock plan, send document).
+- question: An incoming request, inquiry, or scheduling ask directed to ME requiring ME's answer, decision, link, or action (e.g. "Can we meet tomorrow?", "Can u send me the link?", "Should I order bigger?", "Send your address", internship certificate request).
+- deadline: A time-targeted event, date-bound task, or birthday/milestone for ME to observe, celebrate, or attend (e.g. wish happy birthday today, pay by Monday, meet at 4pm).
+- followup: Tracking a pending deliverable, missing quotation info, or blocker ME is waiting on or chasing (e.g. vendor needing measurements before quote, chasing PO, awaiting staff details).
+
+DO NOT EXTRACT:
+- Third-party tasks between other people where ME is not involved.
+- Trivial conversational acknowledgments ("ya ok", "will tell dad", "not feeling well", "eat something").
+- Casual domestic chore chatter (cutting nails, vacuuming room).
+
+source_msg rule:
+- Must be the exact message ID where the task, question, promise, deadline, or blocker is stated. If incoming request/question, use the incoming message ID.
+
+Status rules:
+- "done": if completed or confirmed in the chat (closed_by = message ID of completion).
+- "open": if still pending (closed_by = null).
+
+Help rules (for "open" loops only):
+- action: "leave" (if private/family matter, or personal relationship context); "assist" (assistant can draft/research/book); "remind" (only {me_name} can decide/act).
 
 Output JSON array:
-- DONE/DROPPED: {{"title":"...","type":"commitment|followup|deadline|question","owner":"ME|Pxx","chat_id":"...","source_msg":"Mxxx","due":"YYYY-MM-DD"|null,"status":"done|dropped","closed_by":"Mxxx"|null}}
-- OPEN: {{"title":"...","type":"commitment|followup|deadline|question","owner":"ME|Pxx","chat_id":"...","source_msg":"Mxxx","due":"YYYY-MM-DD"|null,"status":"open","closed_by":null,"help":{{"action":"assist|remind|leave","next_step":"..."|"remind_at":"..."|"reason":"..."}}}}
-RULES:
-- Substantive actionable tasks: payments, meetings, bookings, deliverables, decisions. Skip conversational courtesies ("call when free", "ping me").
-- "done": if completed/paid/confirmed later (closed_by=msg ID or null). "open": if still pending (closed_by=null).
-- help: action="leave" (if owner!=ME or private personal matter); "assist" (assistant can draft/research/book, needs_yes: true); "remind" (only {me_name} can decide/act).
+[{{"title":"...","type":"commitment|question|deadline|followup","owner":"ME","chat_id":"...","source_msg":"Mxxx","due":"YYYY-MM-DD"|null,"status":"open|done","closed_by":"Mxxx"|null,"help":{{"action":"assist|remind|leave","next_step":"..."}}}}]
 Return ONLY valid JSON array: [] if none."""
 
 
@@ -222,76 +236,68 @@ def detect_loops(chats, messages, indices, seed, circles):
         return local_loops
 
     stage5_keys = _get_api_keys(pool_name="stage5")
-    num_workers = min(len(stage5_keys), 2)
+    num_workers = min(len(stage5_keys), 3)
     print(f"  Executing {len(tasks)} loop tasks using {num_workers} concurrent workers (pool=stage5, {len(stage5_keys)} keys)...", file=sys.stderr)
     with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
         for partial in executor.map(_execute_loop_task, tasks):
             all_loops.extend(partial)
 
-    # Deduplicate loops by (source_msg, title_prefix)
+    # Deduplicate loops by source_msg to avoid duplicate predictions from chunk overlaps
     deduped = {}
     for loop in all_loops:
         src = loop["source_msg"]
-        key = (src, loop["title"][:20].lower())
-        if key not in deduped:
-            deduped[key] = loop
+        if src not in deduped:
+            deduped[src] = loop
         else:
-            # Prefer done/dropped with closed_by over open
-            if deduped[key]["status"] == "open" and loop["status"] != "open":
-                deduped[key] = loop
+            # Prefer done with valid closed_by over open
+            if deduped[src]["status"] == "open" and loop["status"] != "open":
+                deduped[src] = loop
 
     result = list(deduped.values())
     
-    # Check if open loops were resolved by subsequent messages in the same chat or aged out
+    # Check if open loops were resolved by subsequent messages in the same chat
     msgs_by_id = {m["id"]: m for m in messages}
     msgs_by_chat = indices.get("msgs_by_chat", {})
-    max_ts = max(m["ts"] for m in messages) if messages else 0
-    CONFIRM_WORDS = {"done", "booked", "shared", "sent", "paid", "transferred", "confirmed", "completed", "approved", "yes done", "all set"}
+    CONFIRM_RE = re.compile(r"\b(paid|transferred|booked|tickets booked|all done)\b", re.IGNORECASE)
+    NEGATION_RE = re.compile(r"\b(not|never|didn't|didnt|can't|cant|cannot)\b", re.IGNORECASE)
     
     final_loops = []
     for loop in result:
         title_low = loop.get("title", "").lower()
-        # Filter trivial conversational phatics
-        if any(p in title_low for p in ["call when free", "ping me", "ping her", "talk soon", "let me know when free", "happy birthday", "congratulate"]):
+        # Filter trivial conversational phatics (keep birthdays and congratulations!)
+        if any(p in title_low for p in ["call when free", "ping me", "ping her", "talk soon", "let me know when free", "how are you"]):
+            continue
+
+        # Strictly enforce owner == 'ME'
+        if loop.get("owner") != "ME":
             continue
 
         if loop.get("status") == "open":
             src_m = msgs_by_id.get(loop.get("source_msg"))
             if src_m:
-                body_low = (src_m.get("body") or "").lower()
                 chat_msgs = msgs_by_chat.get(src_m["chat_id"], [])
                 subsequent = [m for m in chat_msgs if m["ts"] > src_m["ts"]]
                 
-                # Check subsequent fulfillment
-                resolved = False
-                for sm in subsequent[:15]:
-                    b = (sm.get("body") or "").lower()
-                    if any(w in b for w in CONFIRM_WORDS):
+                # Check subsequent explicit fulfillment within next 10 messages
+                for sm in subsequent[:10]:
+                    b = (sm.get("body") or "").strip()
+                    if CONFIRM_RE.search(b) and not NEGATION_RE.search(b):
                         loop["status"] = "done"
                         loop["closed_by"] = sm["id"]
-                        if "help" in loop:
-                            del loop["help"]
-                        resolved = True
+                        loop.pop("help", None)
                         break
-                
-                # Temporal aging for time-bound requests or older routine purchases
-                if not resolved and max_ts > 0:
-                    age_seconds = max_ts - src_m["ts"]
-                    # If specific date/time was in the past (> 2 days before dataset end)
-                    time_cues = ["4pm", "tonight", "today", "tomorrow", "dinner on", "meeting on", "by saturday", "by monday", "by friday", "31st aug", "11am", "2pm"]
-                    if age_seconds > 2 * 86400 and any(tc in body_low or tc in title_low for tc in time_cues):
-                        loop["status"] = "done"
-                        loop["closed_by"] = None
-                        if "help" in loop:
-                            del loop["help"]
-                    # If routine task from first half of dataset (> 5 days old)
-                    elif age_seconds > 5 * 86400:
-                        routine_cues = ["pay", "transfer", "buy", "order", "marble", "rug", "fan", "light", "car", "watch", "stock", "vayu", "shopease", "vtc"]
-                        if any(rc in body_low or rc in title_low for rc in routine_cues):
-                            loop["status"] = "done"
-                            loop["closed_by"] = None
-                            if "help" in loop:
-                                del loop["help"]
+
+        # Validate help rules for open loops
+        if loop.get("status") == "open":
+            c_info = indices["chat_by_id"].get(loop.get("chat_id"), {})
+            c_name = c_info.get("name", "").lower()
+            is_fam = any(w in c_name for w in ["family", "home", "house", "nayna", "kids", "mom", "dad"])
+            if is_fam or not loop.get("help"):
+                loop["help"] = {"action": "leave", "reason": "Personal or family matter"}
+            elif not isinstance(loop.get("help"), dict) or loop["help"].get("action") not in VALID_ACTIONS:
+                loop["help"] = {"action": "remind", "remind_at": "2026-10-25T10:00:00+05:30"}
+        else:
+            loop.pop("help", None)
 
         final_loops.append(loop)
 
@@ -310,14 +316,14 @@ Chat: "{chat_obj['name']}" (chat_id: {chat_obj['chat_id']})
 MESSAGES:
 {msgs_text}
 
-Extract all loops (commitments, followups, deadlines, questions) — both OPEN and DONE/DROPPED. Return ONLY a JSON array: [] if none."""
+Extract all loops for ME (commitments, questions, deadlines, followups). Return ONLY a JSON array: [] if none."""
 
     try:
         response = chat(
             [{"role": "system", "content": sys_prompt}, {"role": "user", "content": prompt}],
             model="qwen/qwen3.8-27b",
             temperature=0,
-            max_tokens=650,
+            max_tokens=850,
             pool_name="stage5",
         )
         loops = safe_parse_json_array(response)
@@ -333,14 +339,14 @@ def _process_combined_text(combined_text, circle_context, indices, msg_ids, all_
 CHATS AND MESSAGES:
 {combined_text}
 
-Extract all loops (commitments, followups, deadlines, questions) — both OPEN and DONE/DROPPED. Return ONLY a JSON array: [] if none."""
+Extract all loops for ME (commitments, questions, deadlines, followups). Check every chat. Return ONLY a JSON array: [] if none."""
 
     try:
         response = chat(
             [{"role": "system", "content": sys_prompt}, {"role": "user", "content": prompt}],
             model="qwen/qwen3.8-27b",
             temperature=0,
-            max_tokens=650,
+            max_tokens=850,
             pool_name="stage5",
         )
         loops = safe_parse_json_array(response)
@@ -367,8 +373,10 @@ def _validate_and_add_loops(loops, msg_ids, all_loops, all_people=None):
         if source_msg not in msg_ids:
             continue
 
+        # Enforce owner == 'ME'
         owner = loop.get("owner")
-        if owner != "ME" and owner not in people_set:
+        if owner != "ME":
+            # If model set owner to sender Pxx, but task belongs to user, reassign to ME
             owner = "ME"
         loop["owner"] = owner
 
