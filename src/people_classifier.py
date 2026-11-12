@@ -248,8 +248,13 @@ Valid circles: {VALID_CIRCLES}"""
         person_chats = indices["chats_per_person"].get(pid, set())
         all_cnames = [indices["chat_by_id"][cid]["name"].lower() for cid in person_chats if cid in indices["chat_by_id"]]
 
+        is_carpool_kitchen = any("carpool" in cn or "kitchen" in cn for cn in all_cnames)
+
+        # Primary spouse priority
+        if is_carpool_kitchen or any(k in pname for k in ["nayna", "❤️", "karan ❤️", "darling"]):
+            result[pid] = "spouse"
         # Sibling group chats
-        if any("sibling" in cn for cn in all_cnames):
+        elif any("sibling" in cn for cn in all_cnames):
             result[pid] = "sibling"
         # Caretaker / staff
         elif "bania" in pname or "farmhouse" in pname:
