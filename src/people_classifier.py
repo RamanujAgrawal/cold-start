@@ -265,8 +265,10 @@ Valid circles: {VALID_CIRCLES}"""
 
         is_carpool_kitchen = any("carpool" in cn or "kitchen" in cn for cn in all_cnames)
 
-        # Spouse priority (household co-management or explicit spouse indicators)
-        if is_carpool_kitchen or any(k in pname for k in ["nayna", "❤️", "karan ❤️", "darling"]):
+        # Spouse priority: requires a direct 1:1 domestic channel with ME or explicit spouse markers.
+        # This ensures domestic kitchen/carpool group staff (like cooks/maids) are not mislabeled as spouse.
+        has_dm = any(not indices["chat_by_id"][cid]["is_group"] for cid in person_chats if cid in indices["chat_by_id"])
+        if (is_carpool_kitchen and has_dm) or any(k in pname for k in ["nayna", "❤️", "karan ❤️", "darling"]):
             result[pid] = "spouse"
         # Sibling group chats
         elif any("sibling" in cn for cn in all_cnames):
