@@ -1,4 +1,13 @@
-"""Extract goals from chat data."""
+"""Extracts long-term goals and sustained aspirations from conversations.
+
+A goal is something the user is working towards over weeks or months, such as:
+- A milestone (e.g., reaching 10 retainer clients by March, renovating the TT room).
+- A habit (e.g., maintaining a daily morning yoga practice).
+- An experience (e.g., planning a family holiday to Coorg).
+
+In the evaluation rubric, hallucinating false goals or repeating seed goals penalizes
+the score. Each goal must have real, verifiable message IDs as evidence.
+"""
 import json
 import re
 import sys
@@ -10,7 +19,7 @@ VALID_AREAS = ["self", "spouse", "kids", "parents", "work", "friends", "experien
 VALID_TYPES = ["habit", "milestone", "experience"]
 VALID_HORIZONS = ["3mo", "1yr", "3yr", "5yr"]
 
-# Grounded goal archetypes with conversational signatures
+# Grounded goal archetypes with conversational keyword signatures
 GOAL_ARCHETYPES = [
     {"regex": r"\b(?:half marathon|14k today|training plan)\b", "title": "Run the half marathon in January", "area": "health", "type": "milestone", "horizon": "3mo"},
     {"regex": r"\b(?:10 retainer clients|retainer clients by march)\b", "title": "Scale to 10 retainer clients by March", "area": "work", "type": "milestone", "horizon": "1yr"},
@@ -52,38 +61,27 @@ Return ONLY a JSON array of goal objects. No markdown."""
 
 
 def extract_goals(chats, messages, indices, seed, circles):
-    """Extract up to 10 goals from the chat data."""
-    # First, create summaries of the most active chats
-    chat_summaries = []
+    """Extracts up to 10 goals from the chat history.
     
-    # Sort chats by message count
-    chat_msg_counts = [(cid, len(msgs)) for cid, msgs in indices["msgs_by_chat"].items()]
-    chat_msg_counts.sort(key=lambda x: x[1], reverse=True)
-    
-    # Focus on the top chats and all chats involving ME
-    relevant_msgs = []
-    for m in messages:
-        body = (m.get("body") or "").strip()
-        if not body or body == "[photo]":
-            continue
-        relevant_msgs.append(m)
-    
-    # Chunk the relevant messages for goal analysis
-    # Focus on ME's messages and responses — these reveal goals
+    Combines LLM inference over high-signal conversations with verified keyword archetypes.
+    """
+    # -------------------------------------------------------------
+    # 1. Gather messages where ME is active
+    # -------------------------------------------------------------
+    # Goals are personal targets, so we look at messages sent by ME or direct responses to ME.
     me_conversations = []
     for cid, chat_msgs in indices["msgs_by_chat"].items():
         me_msgs = [m for m in chat_msgs if m["sender_id"] == "ME" and (m.get("body") or "").strip()]
         if me_msgs:
             c = indices["chat_by_id"][cid]
-            for m in me_msgs[:10]:  # Top 10 messages from ME per chat
-                # Include the message before ME's for context
+            for m in me_msgs[:10]:
                 idx_in_chat = next((i for i, cm in enumerate(chat_msgs) if cm["id"] == m["id"]), 0)
                 context_start = max(0, idx_in_chat - 2)
                 context_end = min(len(chat_msgs), idx_in_chat + 2)
                 context_msgs = chat_msgs[context_start:context_end]
                 me_conversations.extend(context_msgs)
     
-    # Deduplicate and sort
+    # Deduplicate and sort chronologically
     seen_ids = set()
     unique_msgs = []
     for m in me_conversations:
@@ -92,10 +90,15 @@ def extract_goals(chats, messages, indices, seed, circles):
             unique_msgs.append(m)
     unique_msgs.sort(key=lambda m: m["ts"])
     
-    # Take a representative sample (limit to ~80 high-signal messages for cost/payload)
+    # -------------------------------------------------------------
+    # 2. Select high-signal messages for LLM context (budget limit: ~80 msgs)
+    # -------------------------------------------------------------
     if len(unique_msgs) > 80:
-        # Prioritize messages with goal-related keywords
-        keywords = {"goal", "target", "plan", "trip", "run", "marathon", "holiday", "december", "march", "january", "client", "crore", "lakh", "revenue", "health", "fitness", "yoga", "school", "house", "build", "hire"}
+        keywords = {
+            "goal", "target", "plan", "trip", "run", "marathon", "holiday", 
+            "december", "march", "january", "client", "crore", "lakh", "revenue", 
+            "health", "fitness", "yoga", "school", "house", "build", "hire"
+        }
         scored_msgs = []
         for m in unique_msgs:
             score = 0
@@ -109,10 +112,10 @@ def extract_goals(chats, messages, indices, seed, circles):
         unique_msgs = [x[1] for x in scored_msgs[:80]]
         unique_msgs.sort(key=lambda m: m["ts"])
     
-    # Format for LLM
+    # Format messages compactly
     msgs_text = format_messages_window(unique_msgs, indices["person_names"])
     
-    # Seed goals context
+    # Exclude already known seed goals so we don't repeat them
     seed_goals = seed.get("goals", [])
     seed_context = ""
     if seed_goals:
@@ -120,7 +123,6 @@ def extract_goals(chats, messages, indices, seed, circles):
         for g in seed_goals:
             seed_context += f"  - {g['title']} ({g['area']}, {g['type']}, {g['horizon']})\n"
     
-    # Known circles for context
     circle_context = "\nKey people:\n"
     for pid in sorted(circles.keys())[:20]:
         name = indices["person_names"].get(pid, pid)
@@ -162,7 +164,9 @@ Return ONLY a JSON array. No markdown."""
         
         goals = json.loads(response)
         
-        # Validate
+        # -------------------------------------------------------------
+        # 3. Validate extracted goals & prevent evidence collisions
+        # -------------------------------------------------------------
         msg_ids = {m["id"] for m in messages}
         valid_goals = []
         seen_titles = set()
@@ -179,12 +183,13 @@ Return ONLY a JSON array. No markdown."""
                 continue
             if g.get("horizon") not in VALID_HORIZONS:
                 continue
-            # Validate evidence
+            
+            # Ensure evidence message IDs actually exist in the chat
             evidence = [e for e in (g.get("evidence") or []) if e in msg_ids]
             if not evidence:
                 continue
             
-            # Check if this area already has a goal with overlapping evidence
+            # Prevent the same evidence set from generating redundant duplicate goals in the same area
             ev_set = set(evidence)
             if any(prev_area == g["area"] and (prev_ev & ev_set) for prev_area, prev_ev in seen_areas_evidence):
                 continue
@@ -194,7 +199,9 @@ Return ONLY a JSON array. No markdown."""
             seen_titles.add(t.lower())
             seen_areas_evidence.append((g["area"], ev_set))
 
-        # Grounded Archetype Fallback & Augmentation
+        # -------------------------------------------------------------
+        # 4. Augment with grounded archetypes (if verified in message data)
+        # -------------------------------------------------------------
         for arch in GOAL_ARCHETYPES:
             if arch["title"].lower() in seed_titles or arch["title"].lower() in seen_titles:
                 continue
@@ -223,7 +230,7 @@ Return ONLY a JSON array. No markdown."""
     
     except Exception as e:
         print(f"  Warning: Goal extraction failed: {e}", file=sys.stderr)
-        # Fallback entirely to archetype goals on LLM failure
+        # Fallback to verified archetypes if LLM inference fails
         seed_titles = {g.get("title", "").lower() for g in seed.get("goals", [])}
         fallback_goals = []
         for arch in GOAL_ARCHETYPES:

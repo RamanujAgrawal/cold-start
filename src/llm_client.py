@@ -1,16 +1,18 @@
-"""A robust, standard-library-only client for Groq OpenAI-compatible chat API.
+"""Standard-library HTTP client for OpenAI-compatible chat completion APIs (Groq).
 
-Features:
-- Dual-Organization Leaky Token Bucket: Tracks organization-level 7,200 TPM (120 tok/s refill)
-  across Org A (LLM_API_KEY) and Org B (LLM_STAGE5_KEYS).
-- Minimum Delay Cooperative Scheduling: Dynamically evaluates token availability across Org A and Org B,
-  dispatching immediately to any org with capacity, or picking the org with minimum wait time.
-- Proactive Token Estimation & Pacing: Pre-estimates tokens (len(prompt)//3.2 + max_tokens) and sleeps
-  proactively before dispatching, preventing 429 rate-limit errors entirely.
-- Dynamic Server Header Feedback: Synchronizes local token balances with Groq's authoritative
-  x-ratelimit-remaining-tokens header.
-- Dynamic 429 Handling: Extracts exact retry delays from error messages and headers without crude 60s freeze.
-- Zero Disk Caching & Pure Standard Library: Strictly adheres to competition rules.
+Why standard library?
+The challenge evaluation rules require zero external dependencies (no requests,
+aiohttp, or httpx). We implement this using urllib.request and Python threading.
+
+Rate-Limit & Multi-Key Strategy:
+Free-tier providers (like Groq) enforce strict rate limits: ~7,000 TPM and 30 RPM
+per API key. For 4,500+ messages, naive single-key calls freeze for 60s repeatedly.
+To solve this cleanly:
+1. Multi-key round-robin pooling across available keys in .env.
+2. Token bucket tracking with dynamic server header synchronization (x-ratelimit-remaining-tokens).
+3. Dynamic retry delay extraction directly from 429 response bodies (waiting exact milliseconds/seconds
+   instead of hardcoded sleep intervals).
+4. Strictly in-memory (zero disk caching per challenge rules).
 """
 import collections
 import json

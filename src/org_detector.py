@@ -1,4 +1,13 @@
-"""Detect organisations and assign chats to people or organisations."""
+"""Detects organisations and assigns chats to organisations or people.
+
+An organisation in this system is something the user either runs or belongs to:
+1. Companies / ventures they own, partner with, or help manage (e.g., PostMyAd, Nexus DaaS).
+2. Physical residence ('Home') and vacation homes ('Farmhouse').
+3. Dedicated workspaces ('Office').
+
+Chats are assigned to an organisation if they represent that organisation's operations,
+or to a person if they represent 1:1 personal communication or social friend groups.
+"""
 import json
 import re
 import sys
@@ -11,13 +20,20 @@ ORG_ROLES = ["owner", "partner", "helper", "resident", "parent", "member", "othe
 
 
 def detect_orgs_and_assign_chats(chats, messages, indices, seed, circles):
-    """Detect organisations and assign every chat."""
+    """Discovers active organisations and maps each chat to an organisation or person.
     
+    Returns:
+        valid_orgs: list of organisation dicts conforming to schema.json
+        chat_ties: list of chat assignment dicts (either 'organisation': org_id or 'person': person_id)
+    """
     chat_ties = []
     tied_chat_ids = set()
     seed_orgs = seed.get("organisations", [])
     
-    # 1. Discover potential operational entities from chats & messages
+    # ---------------------------------------------------------
+    # Stage 1: Fast conversational entity discovery
+    # ---------------------------------------------------------
+    # Scan group chat names and message bodies for physical entities and company cues.
     candidate_entities = []
     discovered_brands = []
     has_office = False
@@ -30,7 +46,7 @@ def detect_orgs_and_assign_chats(chats, messages, indices, seed, circles):
         if "operations" in clower:
             brand = cname.lower().split("operations")[0].strip(" -:<>/_")
             if brand and len(brand) > 2:
-                # Check if brand is already a seed org or acronym of a seed org (e.g. PMA -> PostMyAd)
+                # Deduplicate acronyms: e.g., don't create 'PMA' if 'PostMyAd' is already known
                 is_seed_variant = False
                 for s in seed_orgs:
                     s_words = [w for w in re.findall(r'[A-Z][a-z]*', s) if w] or s.split()
@@ -52,7 +68,6 @@ def detect_orgs_and_assign_chats(chats, messages, indices, seed, circles):
             has_daas = True
             candidate_entities.append("Company: 'Nexus DaaS'")
 
-    # Check for office in contacts/chats
     for c in chats:
         if "office" in c.get("name", "").lower():
             has_office = True
@@ -68,7 +83,9 @@ def detect_orgs_and_assign_chats(chats, messages, indices, seed, circles):
 
     candidate_str = ", ".join(sorted(set(candidate_entities))) if candidate_entities else "None"
 
-    # 2. Build concise group chat summaries for LLM
+    # ---------------------------------------------------------
+    # Stage 2: Build concise group chat summaries for LLM prompt
+    # ---------------------------------------------------------
     group_chats = [c for c in chats if c["is_group"]]
     group_summaries = []
     
@@ -141,7 +158,9 @@ Return ONLY a JSON object:
         
         result = json.loads(response)
         
-        # Validate organisations
+        # ---------------------------------------------------------
+        # Stage 3: Normalize & validate organisations
+        # ---------------------------------------------------------
         valid_orgs = []
         org_ids = set()
         org_names_lower = set()
@@ -171,7 +190,7 @@ Return ONLY a JSON object:
                 org_ids.add(org["id"])
                 org_names_lower.add(oname_low)
 
-        # Ensure seed organisations are present
+        # Guarantee seed organisations are represented
         for s_org in seed_orgs:
             if s_org.lower() not in org_names_lower:
                 oid = f"org_seed_{len(valid_orgs)+1}"
@@ -179,14 +198,14 @@ Return ONLY a JSON object:
                 org_ids.add(oid)
                 org_names_lower.add(s_org.lower())
 
-        # Ensure Home is present
+        # Guarantee Home is represented
         if "home" not in org_names_lower:
             home_id = f"org_home_{len(valid_orgs)+1}"
             valid_orgs.append({"id": home_id, "name": "Home", "type": "residence", "side": "home", "role": "owner"})
             org_ids.add(home_id)
             org_names_lower.add("home")
 
-        # Ensure discovered physical entities and ventures are present
+        # Guarantee physical entities discovered in chats are present
         if has_office and "office" not in org_names_lower:
             off_id = f"org_office_{len(valid_orgs)+1}"
             valid_orgs.append({"id": off_id, "name": "Office", "type": "workspace", "side": "work", "role": "owner"})
@@ -221,15 +240,18 @@ Return ONLY a JSON object:
             org_ids.add(daas_id)
             org_names_lower.add("nexus daas")
 
-        # Build alias lookup for organisations
+        # ---------------------------------------------------------
+        # Stage 4: Chat assignment & binding
+        # ---------------------------------------------------------
+        # Helper to match chat titles to known org aliases
         def get_matching_org(chat_name):
             c_low = chat_name.lower()
             for o in valid_orgs:
                 oname = o["name"].lower()
-                # Direct match
+                # Direct string match
                 if len(oname) > 2 and (oname in c_low or c_low in oname):
                     return o["id"]
-                # Aliases
+                # Known aliases and operational patterns
                 if "nexus" in oname:
                     if any(w in c_low for w in ["nexus", "d2c", "d2b"]):
                         return o["id"]
@@ -241,7 +263,6 @@ Return ONLY a JSON object:
                         return o["id"]
             return None
 
-        # Validate group chat ties from LLM
         all_person_ids = set(indices["all_people"])
         for tie in result.get("chats", []):
             cid = tie.get("chat_id")
@@ -251,7 +272,6 @@ Return ONLY a JSON object:
             c_obj = indices["chat_by_id"].get(cid, {})
             c_name = c_obj.get("name", "")
 
-            # Verify with keyword rules
             matched_alias = get_matching_org(c_name)
             if matched_alias:
                 chat_ties.append({"chat_id": cid, "organisation": matched_alias})
@@ -263,7 +283,7 @@ Return ONLY a JSON object:
                 chat_ties.append({"chat_id": cid, "organisation": tie["organisation"]})
                 tied_chat_ids.add(cid)
         
-        # Ensure any unassigned chat gets assigned cleanly
+        # Ensure any unassigned chat gets cleanly tied
         for c in chats:
             cid = c["chat_id"]
             if cid in tied_chat_ids:
@@ -276,14 +296,14 @@ Return ONLY a JSON object:
                 if matched_org:
                     chat_ties.append({"chat_id": cid, "organisation": matched_org})
                 else:
-                    # Social/casual group: tie to first non-ME participant rather than corrupting business orgs
+                    # For social / casual groups that aren't company orgs, tie to the first non-ME participant
                     other = next((p for p in c["participants"] if p != "ME"), None)
                     if other:
                         chat_ties.append({"chat_id": cid, "person": other})
                     elif valid_orgs:
                         chat_ties.append({"chat_id": cid, "organisation": valid_orgs[0]["id"]})
             else:
-                # 1:1 DMs
+                # 1:1 Direct Messages
                 other = next((p for p in c["participants"] if p != "ME"), None)
                 chat_msgs = indices["msgs_by_chat"].get(cid, [])
                 sample_text = " ".join((m.get("body") or "") for m in chat_msgs[:4]).lower()
@@ -293,7 +313,7 @@ Return ONLY a JSON object:
                 nexus_org = next((o["id"] for o in valid_orgs if o["name"].lower() == "nexus"), None)
                 daas_org = next((o["id"] for o in valid_orgs if "daas" in o["name"].lower() or "milestone" in o["name"].lower()), None)
 
-                # Special organizational DM patterns:
+                # Route specific operational 1:1 channels to their companies/projects:
                 # Home renovation contractor
                 if home_org and any(w in sample_text for w in ["bankura", "material order", "suku da"]):
                     chat_ties.append({"chat_id": cid, "organisation": home_org})
@@ -321,11 +341,11 @@ Return ONLY a JSON object:
 
 
 def _fallback_orgs_and_chats(chats, indices, seed):
-    """Fallback: minimal org detection without LLM."""
+    """Deterministic fallback when LLM inference is unavailable."""
     orgs = []
     chat_ties = []
     
-    # Seed orgs
+    # Register seeded organisations
     seed_org_names = seed.get("organisations", [])
     org_map = {}
     for i, name in enumerate(seed_org_names):
@@ -336,7 +356,7 @@ def _fallback_orgs_and_chats(chats, indices, seed):
         role = "owner"
         orgs.append({"id": oid, "name": name, "type": otype, "side": side, "role": role})
     
-    # Add home
+    # Always include Home
     home_id = f"O{len(orgs)+1}"
     orgs.append({"id": home_id, "name": "Home", "type": "residence", "side": "home", "role": "owner"})
     

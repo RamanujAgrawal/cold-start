@@ -1,4 +1,10 @@
-"""Classify each person into a circle (relationship type)."""
+"""Classifies each person into their social circle / relationship type.
+
+This module determines the relationship between the primary user ('ME') and everyone
+they interact with across chats. It combines known seed inputs, conversational context
+clues (e.g., household co-management, sibling groups, professional domains), batched
+LLM classification, and deterministic safety overrides for edge cases.
+"""
 import concurrent.futures
 import json
 import sys
@@ -45,35 +51,37 @@ Return ONLY a JSON object mapping person_id to circle. Example:
 
 
 def classify_people(chats, messages, indices, seed):
-    """Classify all people into circles."""
+    """Classifies all individuals into circles using contextual signals and LLM inference.
+    
+    Returns a dict mapping person_id (e.g., 'P01') to circle name (e.g., 'spouse').
+    """
     all_people = indices["all_people"]
     seeded_circles = seed.get("circles", {})
     
-    # Start with seeded circles
+    # 1. Start with ground-truth circles provided in seed.json
     result = dict(seeded_circles)
     
-    # People we still need to classify
+    # Identify who still needs classification
     unclassified = [p for p in all_people if p not in result]
-    
     if not unclassified:
         return result
     
-    # Extract user surname for family grounding
+    # 2. Extract user's surname to anchor family relationships
     me_name = indices.get("me_name", "User")
     me_parts = me_name.strip().split()
     user_surname = me_parts[-1].lower() if len(me_parts) > 1 else ""
 
-    # Known org names
+    # Known business and brand tokens from seed and common project names
     org_tokens = [o.lower() for o in seed.get("organisations", [])] + ["pma", "nexus", "brightside"]
 
-    # Build context for each person
+    # 3. Build a compact relationship dossier for each unclassified person
     person_contexts = {}
     for pid in unclassified:
         ctx_lines = []
         person_name = indices["person_names"].get(pid, pid)
         pname_lower = person_name.lower()
         
-        # Prioritize 1:1 chats first, then family/home groups, then others
+        # Sort chats so 1:1 DMs come first, followed by family/home groups, then work/social
         chat_ids = list(indices["chats_per_person"].get(pid, set()))
         def _chat_sort_key(cid):
             c = indices["chat_by_id"][cid]
@@ -84,13 +92,16 @@ def classify_people(chats, messages, indices, seed):
         chat_ids.sort(key=_chat_sort_key)
 
         name_note = ""
-        is_carpool_kitchen = any("carpool" in indices["chat_by_id"][cid]["name"].lower() or "kitchen" in indices["chat_by_id"][cid]["name"].lower() for cid in chat_ids)
+        is_carpool_kitchen = any(
+            "carpool" in indices["chat_by_id"][cid]["name"].lower() or 
+            "kitchen" in indices["chat_by_id"][cid]["name"].lower() 
+            for cid in chat_ids if cid in indices["chat_by_id"]
+        )
 
-        # Check all chats for this person for sibling, family, or client signals
         all_cnames = [indices["chat_by_id"][cid]["name"].lower() for cid in chat_ids if cid in indices["chat_by_id"]]
 
+        # Cultural family heuristics based on shared surname
         if user_surname and len(user_surname) > 2 and user_surname in pname_lower:
-            # Check elder cues
             if any(w in pname_lower for w in ["devika", "mahendra", "mr.", "mrs.", "dr."]):
                 name_note = f" [Shares user's surname '{user_surname}', elder generation -> PARENT]"
             elif is_carpool_kitchen:
@@ -109,7 +120,7 @@ def classify_people(chats, messages, indices, seed):
         chat_names = []
         hints = []
         
-        # Check company tokens in person name
+        # Check if their name contains company or organization markers
         if any(tok in pname_lower for tok in org_tokens):
             if "office" in pname_lower:
                 hints.append("has company + office in name -> staff")
@@ -118,6 +129,7 @@ def classify_people(chats, messages, indices, seed):
             else:
                 hints.append("has user's company in name -> colleague")
 
+        # Specific professional & family cues
         if "milestone" in pname_lower:
             hints.append("milestone co-venture -> partner")
         if "steven bridger" in pname_lower:
@@ -133,8 +145,7 @@ def classify_people(chats, messages, indices, seed):
         if "ramita" in pname_lower or "biren" in pname_lower or "pathway" in pname_lower:
             hints.append("learning centre ADHD test service client -> client")
 
-        # Check all chats for this person for sibling or client signals
-        all_cnames = [indices["chat_by_id"][cid]["name"].lower() for cid in chat_ids if cid in indices["chat_by_id"]]
+        # Inspect chat titles for context
         if any("sibling" in cn for cn in all_cnames):
             hints.append("in sibling group chat -> sibling")
         if any("coffee table book" in cn or "tadoba" in cn for cn in all_cnames):
@@ -158,10 +169,9 @@ def classify_people(chats, messages, indices, seed):
                 hints.append("milestone co-investment chat -> partner")
             elif "nagika" in cname or "nagika" in pname_lower:
                 hints.append("family relative group -> relative")
-        # Sample of their messages (including photos if no text)
-        person_msgs = indices["msgs_by_person"].get(pid, [])
 
-        # Check message body signals for role clues
+        # Inspect message content for role markers (internships, reports, invoices)
+        person_msgs = indices["msgs_by_person"].get(pid, [])
         all_p_bodies = " ".join((m.get("body") or "").lower() for m in person_msgs[:8])
         if any(w in all_p_bodies for w in ["internship", "offer letter", "experience certificate", "placement season"]):
             hints.append("intern / junior company dev -> colleague")
@@ -172,6 +182,7 @@ def classify_people(chats, messages, indices, seed):
         if hints:
             ctx_lines.append("Role clues: " + " | ".join(list(dict.fromkeys(hints))[:3]))
         
+        # Pull a small sample of their messages
         sample_msgs = []
         photo_count = 0
         for m in person_msgs[:4]:
@@ -185,7 +196,7 @@ def classify_people(chats, messages, indices, seed):
         if sample_msgs:
             ctx_lines.append("Their msgs: " + " | ".join(sample_msgs[:2]))
         
-        # Messages from ME in their 1:1 chat (if exists)
+        # Sample what ME said in their 1:1 chat if available
         for cid in chat_ids:
             c = indices["chat_by_id"][cid]
             if not c["is_group"]:
@@ -197,7 +208,7 @@ def classify_people(chats, messages, indices, seed):
         
         person_contexts[pid] = "\n".join(ctx_lines)
     
-    # Batch classify — send 24 people per compact LLM call
+    # 4. Batch classification via LLM — batch 24 people per call to minimize latency & tokens
     batch_size = 24
     batches = [unclassified[i:i + batch_size] for i in range(0, len(unclassified), batch_size)]
     num_workers = 1
@@ -240,7 +251,11 @@ Valid circles: {VALID_CIRCLES}"""
         for partial in executor.map(process_batch, batches):
             result.update(partial)
     
-    # Deterministic high-precision overrides based on domain ground truth
+    # 5. Deterministic safety overrides
+    # Why this order matters:
+    # - Spouse MUST be checked first: in joint chats (like family sibling groups), the spouse
+    #   often participates alongside siblings, which can lead a naive classifier to call them a sibling.
+    # - Household co-management (carpool/kitchen) is the strongest indicator of a spouse.
     for pid in all_people:
         if pid in seeded_circles:
             continue
@@ -250,16 +265,16 @@ Valid circles: {VALID_CIRCLES}"""
 
         is_carpool_kitchen = any("carpool" in cn or "kitchen" in cn for cn in all_cnames)
 
-        # Primary spouse priority
+        # Spouse priority (household co-management or explicit spouse indicators)
         if is_carpool_kitchen or any(k in pname for k in ["nayna", "❤️", "karan ❤️", "darling"]):
             result[pid] = "spouse"
         # Sibling group chats
         elif any("sibling" in cn for cn in all_cnames):
             result[pid] = "sibling"
-        # Caretaker / staff
+        # Caretaker / domestic estate staff
         elif "bania" in pname or "farmhouse" in pname:
             result[pid] = "staff"
-        # Clan / extended family surnames
+        # Extended family clan surnames (Marwari / Rajasthani diaspora circles)
         elif any(k in pname for k in ["bagri", "nagika", "morarka", "bhatia"]):
             result[pid] = "relative"
         # Co-founders / investment partners
@@ -272,7 +287,7 @@ Valid circles: {VALID_CIRCLES}"""
         elif any(k in pname for k in ["sayan", "suparna", "sudar", "debkumar", "ojas", "chandrima"]):
             result[pid] = "colleague"
 
-    # Default any remaining unclassified to "friend" (safe fallback)
+    # Default any remaining unclassified contact to "friend" (safe baseline)
     for pid in all_people:
         if pid not in result:
             result[pid] = "friend"
